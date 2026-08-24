@@ -2,7 +2,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
-from torchvision.models.resnet import ResNet, BasicBlock
+from torchvision.models.resnet import ResNet, BasicBlock, resnet18
 
 from src.globals import DATASETS
 
@@ -38,6 +38,23 @@ class CIFARResNet18(ResNet):
 		return out
 
 
+def build_cifar_resnet18(num_classes: int) -> nn.Module:
+	"""
+	Build a CIFAR-10/100 ResNet-18 model.
+	:param num_classes: Number of output classes
+	:return: Instantiated PyTorch model
+	"""
+
+	# Instantiate a standard ResNet-18 model
+	model = resnet18(num_classes=num_classes)
+
+	# Edit the first convolutional layer for 32x32 inputs (CIFAR)
+	model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+	model.maxpool = nn.Identity()
+
+	return model
+
+
 def build_model(arch: str, dataset: str, paradigm: str) -> nn.Module:
 	"""
 	Build a model based on the specified architecture, dataset, and training paradigm.
@@ -53,7 +70,7 @@ def build_model(arch: str, dataset: str, paradigm: str) -> nn.Module:
 	num_classes = DATASETS[dataset]["num_classes"]
 
 	if arch == "cnn" and paradigm == "std":
-		return CIFARResNet18(num_classes=num_classes)
+		return build_cifar_resnet18(num_classes)
 
 	if arch == "vit":
 		raise NotImplementedError("ViT")

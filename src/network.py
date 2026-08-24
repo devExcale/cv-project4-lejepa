@@ -1,0 +1,64 @@
+from typing import Tuple
+
+import torch
+import torch.nn as nn
+from torchvision.models.resnet import ResNet, BasicBlock
+
+from src.globals import DATASETS
+
+
+class CIFARResNet18(ResNet):
+
+	def __init__(self, num_classes: int = 100):
+		super(CIFARResNet18, self).__init__(
+			block=BasicBlock,
+			layers=[2, 2, 2, 2],
+			num_classes=num_classes
+		)
+		self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+		self.bn1 = nn.BatchNorm2d(64)
+		self.maxpool = nn.Identity()
+
+	def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+		x = self.relu(self.bn1(self.conv1(x)))
+		x = self.maxpool(x)
+
+		stage1 = self.layer1(x)  # [B, 64, 32, 32]
+		stage2 = self.layer2(stage1)  # [B, 128, 16, 16]
+		stage3 = self.layer3(stage2)  # [B, 256, 8, 8]
+		stage4 = self.layer4(stage3)  # [B, 512, 4, 4]
+
+		return stage1, stage2, stage3, stage4
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		*_, stage4 = self.forward_features(x)
+		out = self.avgpool(stage4)
+		out = torch.flatten(out, 1)
+		out = self.fc(out)
+		return out
+
+
+def build_model(arch: str, dataset: str, paradigm: str) -> nn.Module:
+	"""
+	Build a model based on the specified architecture, dataset, and training paradigm.
+	:param arch: Model architecture
+	:param dataset: Dataset name
+	:param paradigm: Training paradigm
+	:return: Instantiated PyTorch model
+	"""
+
+	if dataset not in DATASETS:
+		raise ValueError(f"Unknown dataset '{dataset}'. Registered datasets: {list(DATASETS.keys())}")
+
+	num_classes = DATASETS[dataset]["num_classes"]
+
+	if arch == "cnn" and paradigm == "std":
+		return CIFARResNet18(num_classes=num_classes)
+
+	if arch == "vit":
+		raise NotImplementedError("ViT")
+
+	if paradigm == "lejepa":
+		raise NotImplementedError("LeJEPA")
+
+	raise ValueError(f"Unknown combination of architecture '{arch}' and paradigm '{paradigm}'.")

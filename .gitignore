@@ -1,7 +1,13 @@
 # Created by https://www.toptal.com/developers/gitignore/api/pycharm,jupyternotebooks,python
 
 ### Custom ###
+
+# PyCharm configuration folder
 .idea
+
+# Binary directories
+checkpoints/
+data/
 
 ### JupyterNotebooks ###
 # gitignore template for Jupyter Notebooks

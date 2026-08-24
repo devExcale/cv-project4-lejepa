@@ -1,4 +1,4 @@
-# Project 6: Emerging Interpretability in LeJEPA vs. Supervised Learning
+# Project 4: Emerging Interpretability in LeJEPA vs. Supervised Learning
 
 ## Abstract
 

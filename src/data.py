@@ -34,13 +34,16 @@ class HuggingFaceDataset(Dataset):
 		)
 		self.transform = transform
 		self.label_key = self.spec["label_key"]
+		self.image_key = self.spec.get("image_key", "image")
 
 	def __len__(self) -> int:
 		return len(self.dataset)
 
 	def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
 		item = self.dataset[idx]
-		image = item["img"].convert("RGB")
+
+		raw_img = item.get(self.image_key) or item.get("img") or item.get("image")
+		image = raw_img.convert("RGB")
 		label = item[self.label_key]
 
 		if self.transform:
@@ -63,6 +66,15 @@ def get_or_compute_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[fl
 		std = tuple(stats_cache[dataset_name]["std"])
 		return mean, std
 
+	# Return standard constants for ImageNet/ImageNet-100
+	if "imagenet" in dataset_name.lower():
+		mean_list = [0.485, 0.456, 0.406]
+		std_list = [0.229, 0.224, 0.225]
+		stats_cache[dataset_name] = {"mean": mean_list, "std": std_list}
+		with open(PATH_DATASET_STATS, "w") as f:
+			json.dump(stats_cache, f, indent=4)
+		return tuple(mean_list), tuple(std_list)
+
 	print(f"Channel statistics not cached for '{dataset_name}'. Computing from training split...")
 	raw_dataset = HuggingFaceDataset(
 		dataset_name=dataset_name,
@@ -70,18 +82,18 @@ def get_or_compute_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[fl
 		transform=transforms.ToTensor(),
 		data_dir=DIR_DATA
 	)
-	raw_loader = DataLoader(raw_dataset, batch_size=256, shuffle=False, num_workers=0)
 
 	channel_sum = torch.zeros(3, dtype=torch.float64)
 	channel_sum_sq = torch.zeros(3, dtype=torch.float64)
 	num_pixels = 0
 
-	for images, _ in tqdm(raw_loader, desc=f"Calculating Stats [{dataset_name}]"):
-		# images shape: [B, C, H, W]
-		b, c, h, w = images.shape
-		num_pixels += b * h * w
-		channel_sum += images.sum(dim=[0, 2, 3])
-		channel_sum_sq += (images ** 2).sum(dim=[0, 2, 3])
+	# Iterate sample-by-sample to support variable (non-homogeneous) image sizes
+	for img, _ in tqdm(raw_dataset, desc=f"Calculating Stats [{dataset_name}]"):
+		# img shape: [C, H, W]
+		c, h, w = img.shape
+		num_pixels += h * w
+		channel_sum += img.to(torch.float64).sum(dim=[1, 2])
+		channel_sum_sq += (img.to(torch.float64) ** 2).sum(dim=[1, 2])
 
 	mean = channel_sum / num_pixels
 	std = torch.sqrt((channel_sum_sq / num_pixels) - (mean ** 2))
@@ -98,19 +110,41 @@ def get_or_compute_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[fl
 
 
 def get_transforms(dataset_name: str) -> Tuple[transforms.Compose, transforms.Compose]:
-	mean, std = get_or_compute_stats(dataset_name)
+	spec = DATASETS[dataset_name]
+	input_size = spec.get("input_size", 32)
 
-	train_transform = transforms.Compose([
-		transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
-		transforms.RandomHorizontalFlip(),
-		transforms.ToTensor(),
-		transforms.Normalize(mean=mean, std=std),
-	])
+	# Use standard ImageNet stats for ImageNet, otherwise compute/fetch stats
+	if "imagenet" in dataset_name:
+		mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+	else:
+		mean, std = get_or_compute_stats(dataset_name)
 
-	val_transform = transforms.Compose([
-		transforms.ToTensor(),
-		transforms.Normalize(mean=mean, std=std),
-	])
+	# 32x32 transforms (CIFAR)
+	if input_size == 32:
+		train_transform = transforms.Compose([
+			transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+			transforms.RandomHorizontalFlip(),
+			transforms.ToTensor(),
+			transforms.Normalize(mean=mean, std=std),
+		])
+		val_transform = transforms.Compose([
+			transforms.ToTensor(),
+			transforms.Normalize(mean=mean, std=std),
+		])
+	# 224x224 transforms (ImageNet-100 / ImageNet)
+	else:
+		train_transform = transforms.Compose([
+			transforms.RandomResizedCrop(224),
+			transforms.RandomHorizontalFlip(),
+			transforms.ToTensor(),
+			transforms.Normalize(mean=mean, std=std),
+		])
+		val_transform = transforms.Compose([
+			transforms.Resize(256),
+			transforms.CenterCrop(224),
+			transforms.ToTensor(),
+			transforms.Normalize(mean=mean, std=std),
+		])
 
 	return train_transform, val_transform
 
@@ -122,6 +156,7 @@ def get_dataloaders(
 		data_dir: str = DIR_DATA
 ) -> Tuple[DataLoader, DataLoader]:
 	train_transform, val_transform = get_transforms(dataset_name)
+	val_split = DATASETS[dataset_name].get("val_split", "test")
 
 	train_dataset = HuggingFaceDataset(
 		dataset_name=dataset_name,
@@ -131,7 +166,7 @@ def get_dataloaders(
 	)
 	val_dataset = HuggingFaceDataset(
 		dataset_name=dataset_name,
-		split="test",
+		split=val_split,
 		transform=val_transform,
 		data_dir=data_dir
 	)
@@ -146,7 +181,6 @@ def get_dataloaders(
 		pin_memory=is_cuda,
 		drop_last=True
 	)
-
 	val_loader = DataLoader(
 		val_dataset,
 		batch_size=batch_size,

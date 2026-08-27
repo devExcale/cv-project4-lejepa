@@ -4,7 +4,7 @@ import os
 import torch
 
 from src.data import get_dataloaders
-from src.evaluation import evaluate_model
+from src.evaluation import evaluate_model, run_gradcam_pipeline
 from src.globals import CONFIG, DEVICE, set_seed, DATASETS
 from src.network import build_model
 from src.train import train_supervised
@@ -142,10 +142,26 @@ def main():
 
 	# --- Mode: GRADCAM --- #
 	if args.mode == "gradcam":
-		# TODO: Grad-CAM implementation
-		print("# TODO: Grad-CAM implementation")
 
-		return
+		# Check if checkpoint exists
+		if not os.path.exists(ckpt_path):
+			raise FileNotFoundError(f"No checkpoint found at '{ckpt_path}'. Run training first.")
+
+		# Load model checkpoint
+		checkpoint = torch.load(ckpt_path, map_location=device)
+		model.load_state_dict(checkpoint["model_state_dict"])
+
+		print(f"Loaded checkpoint from '{ckpt_path}' for Grad-CAM probing.")
+
+		run_gradcam_pipeline(
+			model=model,
+			val_loader=val_loader,
+			dataset_name=args.dataset,
+			arch=args.arch,
+			paradigm=args.paradigm,
+			device=device,
+			num_samples=8
+		)
 
 	return
 

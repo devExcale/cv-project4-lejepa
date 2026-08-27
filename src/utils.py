@@ -8,8 +8,7 @@ from src.network import build_model
 
 
 def get_checkpoint_path(dataset: str, arch: str, paradigm: str, tag: str = "best") -> str:
-	filename = f"{dataset}_{arch}_{paradigm}_{tag}.pt"
-	return os.path.join(DIR_CHECKPOINTS, filename)
+	return os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_{paradigm}_{tag}.pt")
 
 
 def test_cuda():
@@ -27,26 +26,23 @@ def test_config(dataset: str, arch: str, paradigm: str):
 	print(f"Training Paradigm:   {paradigm}")
 	print(f"Number of Classes:   {DATASETS[dataset]['num_classes']}")
 	print(f"Checkpoint Target:   {get_checkpoint_path(dataset, arch, paradigm)}")
-	print("Configuration diagnostic verified successfully.")
 
 
 def test_pipeline(dataset: str, arch: str, paradigm: str):
-	print(f"Testing DataLoaders for {dataset}...")
-	train_loader, val_loader = get_dataloaders(dataset_name=dataset, batch_size=8)
-	images, labels = next(iter(train_loader))
-	print(f"Batch shape: {images.shape}, Labels shape: {labels.shape}")
-
-	print(f"Instantiating model ({arch}, {paradigm}) for {dataset}...")
+	train_loader, _ = get_dataloaders(dataset_name=dataset, batch_size=8, paradigm=paradigm)
+	batch, labels = next(iter(train_loader))
 	model = build_model(arch=arch, dataset=dataset, paradigm=paradigm).to(DEVICE)
-	images = images.to(DEVICE)
 
-	if hasattr(model, "forward_features"):
-		s1, s2, s3, s4 = model.forward_features(images)
-		print(f"Stage 1 feature shape: {s1.shape}")
-		print(f"Stage 2 feature shape: {s2.shape}")
-		print(f"Stage 3 feature shape: {s3.shape}")
-		print(f"Stage 4 feature shape: {s4.shape}")
+	if paradigm == "lejepa":
+		global_views = [x.to(DEVICE) for x in batch["global"]]
+		local_views = [x.to(DEVICE) for x in batch["local"]]
+		loss, inv, sig = model(global_views=global_views, local_views=local_views)
+		print(f"LeJEPA loss: {loss.item():.4f} | Inv: {inv.item():.4f} | SIGReg: {sig.item():.4f}")
+		images = global_views[0]
+	else:
+		images = batch.to(DEVICE)
+		print(f"Logits output shape: {model(images).shape}")
 
-	logits = model(images)
-	print(f"Logits output shape:   {logits.shape}")
-	print("Pipeline diagnostic completed successfully.")
+	features = model.forward_features(images)
+	for i, feature in enumerate(features, 1):
+		print(f"Layer {i} feature shape: {tuple(feature.shape)}")

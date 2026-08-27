@@ -12,15 +12,11 @@ from src.globals import DIR_DATA, PATH_DATASET_STATS, DATASETS, CONFIG
 
 
 class HuggingFaceDataset(Dataset):
-	"""
-	PyTorch Dataset wrapper for Hugging Face datasets.
-	"""
-
 	def __init__(
 			self,
 			dataset_name: str,
 			split: str = "train",
-			transform: Optional[transforms.Compose] = None,
+			transform = None,
 			data_dir: str = DIR_DATA
 	):
 		if dataset_name not in DATASETS:
@@ -45,8 +41,39 @@ class HuggingFaceDataset(Dataset):
 
 		if self.transform:
 			image = self.transform(image)
-
+		
 		return image, label
+
+
+class MultiViewDataset(HuggingFaceDataset):
+	def __init__(
+			self,
+			dataset_name: str,
+			global_transform,
+			local_transform,
+			split: str = "train",
+			data_dir: str = DIR_DATA
+	):
+		super().__init__(
+			dataset_name,
+			split=split,
+			transform=None,
+			data_dir=data_dir
+		)
+		self.global_transform = global_transform
+		self.local_transform = local_transform
+
+	def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+		item = self.dataset[idx]
+		image = item["img"].convert("RGB")
+		label = item[self.label_key]
+
+		views = {
+			"global": [self.global_transform(image) for _ in range(2)],
+			"local": [self.local_transform(image) for _ in range(4)],
+		}
+
+		return views, label
 
 
 def get_or_compute_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
@@ -65,7 +92,7 @@ def get_or_compute_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[fl
 
 	print(f"Channel statistics not cached for '{dataset_name}'. Computing from training split...")
 	raw_dataset = HuggingFaceDataset(
-		dataset_name=dataset_name,
+		dataset_name,
 		split="train",
 		transform=transforms.ToTensor(),
 		data_dir=DIR_DATA
@@ -77,8 +104,8 @@ def get_or_compute_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[fl
 	num_pixels = 0
 
 	for images, _ in tqdm(raw_loader, desc=f"Calculating Stats [{dataset_name}]"):
-		# images shape: [B, C, H, W]
-		b, c, h, w = images.shape
+# images shape: [B, C, H, W]
+		b, _, h, w = images.shape
 		num_pixels += b * h * w
 		channel_sum += images.sum(dim=[0, 2, 3])
 		channel_sum_sq += (images ** 2).sum(dim=[0, 2, 3])
@@ -93,11 +120,11 @@ def get_or_compute_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple[fl
 	with open(PATH_DATASET_STATS, "w") as f:
 		json.dump(stats_cache, f, indent=4)
 
-	print(f"Calculated & cached stats for {dataset_name}: Mean={mean_list}, Std={std_list}")
+		print(f"Calculated & cached stats for {dataset_name}: Mean={mean_list}, Std={std_list}")
 	return tuple(mean_list), tuple(std_list)
 
 
-def get_transforms(dataset_name: str) -> Tuple[transforms.Compose, transforms.Compose]:
+def get_transforms(dataset_name: str):
 	mean, std = get_or_compute_stats(dataset_name)
 
 	train_transform = transforms.Compose([
@@ -115,22 +142,57 @@ def get_transforms(dataset_name: str) -> Tuple[transforms.Compose, transforms.Co
 	return train_transform, val_transform
 
 
+def get_lejepa_transforms(dataset_name: str):
+	mean, std = get_or_compute_stats(dataset_name)
+
+	common = [
+		transforms.RandomHorizontalFlip(),
+		transforms.ColorJitter(0.4, 0.4, 0.2, 0.1),
+		transforms.ToTensor(),
+		transforms.Normalize(mean=mean, std=std),
+	]
+
+	global_transform = transforms.Compose([
+		transforms.RandomResizedCrop(32, scale=(0.5, 1.0)),
+		*common,
+	])
+
+	local_transform = transforms.Compose([
+		transforms.RandomResizedCrop(16, scale=(0.2, 0.5)),
+		*common,
+	])
+
+	return global_transform, local_transform
+
+
 def get_dataloaders(
 		dataset_name: str,
 		batch_size: int = CONFIG["batch_size"],
 		num_workers: int = CONFIG["num_workers"],
-		data_dir: str = DIR_DATA
-) -> Tuple[DataLoader, DataLoader]:
+		data_dir: str = DIR_DATA,
+		paradigm: str = "std",
+):
 	train_transform, val_transform = get_transforms(dataset_name)
+	
+	if paradigm == "lejepa":
+		global_transform, local_transform = get_lejepa_transforms(dataset_name)
+		train_dataset = MultiViewDataset(
+			dataset_name,
+			global_transform,
+			local_transform,
+			split="train",
+			data_dir=data_dir
+		)
+	else:
+		train_dataset = HuggingFaceDataset(
+			dataset_name,
+			split="train",
+			transform=train_transform,
+			data_dir=data_dir
+		)
 
-	train_dataset = HuggingFaceDataset(
-		dataset_name=dataset_name,
-		split="train",
-		transform=train_transform,
-		data_dir=data_dir
-	)
 	val_dataset = HuggingFaceDataset(
-		dataset_name=dataset_name,
+		dataset_name,
 		split="test",
 		transform=val_transform,
 		data_dir=data_dir
@@ -146,7 +208,6 @@ def get_dataloaders(
 		pin_memory=is_cuda,
 		drop_last=True
 	)
-
 	val_loader = DataLoader(
 		val_dataset,
 		batch_size=batch_size,
@@ -154,6 +215,6 @@ def get_dataloaders(
 		num_workers=num_workers,
 		pin_memory=is_cuda,
 		drop_last=False
-	)
-
+		)
+	
 	return train_loader, val_loader

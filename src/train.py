@@ -128,3 +128,63 @@ def train_supervised(
 	print(f"\n[Training Complete] Elapsed Time: {total_time / 60:.2f} mins | Best Val Acc: {best_acc:.2f}%\n")
 
 	return history
+
+def train_lejepa(
+		model,
+		train_loader,
+		dataset_name,
+		arch,
+		epochs=CONFIG["epochs"],
+		lr=1e-3,
+		weight_decay=CONFIG["weight_decay"],
+		device=CONFIG["device"]
+):
+	model = model.to(device)
+	optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+	best_loss = float("inf")
+	best_ckpt_path = get_checkpoint_path(dataset_name, arch, "lejepa", "best")
+	history = {"loss": [], "invariance": [], "sigreg": []}
+
+	for epoch in range(1, epochs + 1):
+		model.train()
+		total_loss = total_inv = total_sig = 0.0
+
+		pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{epochs:03d} [LeJEPA]", leave=False)
+
+		for views, _ in pbar:
+			global_views = [x.to(device) for x in views["global"]]
+			local_views = [x.to(device) for x in views["local"]]
+
+			optimizer.zero_grad()
+			# Call LeJEPA.forward(...)
+			loss, inv, sig = model(global_views=global_views, local_views=local_views)
+
+			loss.backward()
+			optimizer.step()
+
+			total_loss += loss.item()
+			total_inv += inv.item()
+			total_sig += sig.item()
+
+		n = len(train_loader)
+		values = total_loss / n, total_inv / n, total_sig / n
+
+		for key, value in zip(history, values):
+			history[key].append(value)
+
+		print(f"Epoch {epoch:03d}/{epochs:03d} | Loss {values[0]:.4f} | Inv {values[1]:.4f} | SIGReg {values[2]:.4f}")
+
+		if values[0] < best_loss:
+			best_loss = values[0]
+			torch.save({
+				"epoch": epoch,
+				"model_state_dict": model.state_dict(),
+				"optimizer_state_dict": optimizer.state_dict(),
+				"loss": best_loss,
+				"history": history,
+				"dataset": dataset_name,
+				"arch": arch,
+				"paradigm": "lejepa"
+			}, best_ckpt_path)
+	return history

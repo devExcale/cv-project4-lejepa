@@ -46,6 +46,12 @@ CONFIG = {
 	"weight_decay": 5e-4,
 	"epochs": 100,
 	"momentum": 0.9,
+
+	"sigreg_slices": 1024,
+	"sigreg_tmax": 3.0,
+	"sigreg_points": 17,
+	"lejepa_lambda": 0.02,
+
 	"device": DEVICE
 }
 

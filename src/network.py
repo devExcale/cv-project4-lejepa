@@ -174,7 +174,7 @@ def build_model(
 	if dataset not in DATASETS:
 		raise ValueError(f"Unknown dataset '{dataset}'. Registered datasets: {list(DATASETS.keys())}")
 
-	num_classes = DATASETS[dataset]["num_classes"]4
+	num_classes = DATASETS[dataset]["num_classes"]
 	
 	if arch == "cnn":
 		backbone = CIFARResNet18(num_classes=num_classes)

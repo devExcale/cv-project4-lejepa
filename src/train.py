@@ -153,8 +153,8 @@ def train_lejepa(
 		pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{epochs:03d} [LeJEPA]", leave=False)
 
 		for views, _ in pbar:
-			global_views = [x.to(device) for x in views["global"]]
-			local_views = [x.to(device) for x in views["local"]]
+			global_views = [x.to(device, non_blocking=True) for x in views["global"]]
+			local_views = [x.to(device, non_blocking=True) for x in views["local"]]
 
 			optimizer.zero_grad()
 			# Call LeJEPA.forward(...)

@@ -206,6 +206,7 @@ def get_dataloaders(
 		shuffle=True,
 		num_workers=num_workers,
 		pin_memory=is_cuda,
+	    persistent_workers=num_workers > 0,
 		drop_last=True
 	)
 	val_loader = DataLoader(

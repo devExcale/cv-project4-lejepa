@@ -187,4 +187,5 @@ def train_lejepa(
 				"arch": arch,
 				"paradigm": "lejepa"
 			}, best_ckpt_path)
+			print(f"--> Saved new best checkpoint to `{best_ckpt_path}` (Loss: {best_loss:.4f})")
 	return history

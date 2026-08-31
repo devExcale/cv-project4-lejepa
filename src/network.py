@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torchvision.models.resnet import ResNet, BasicBlock
 
 from src.globals import DATASETS, CONFIG
+from src.vit import VisionTransformer
 
 
 class CIFARResNet18(ResNet):
@@ -174,13 +175,12 @@ def build_model(
 	if dataset not in DATASETS:
 		raise ValueError(f"Unknown dataset '{dataset}'. Registered datasets: {list(DATASETS.keys())}")
 
-	num_classes = DATASETS[dataset]["num_classes"]4
+	num_classes = DATASETS[dataset]["num_classes"]
 	
 	if arch == "cnn":
 		backbone = CIFARResNet18(num_classes=num_classes)
 	elif arch == "vit":
-		pass
-		#backbone = ViT(num_classes=num_classes)
+		backbone = VisionTransformer(num_classes=num_classes, img_size=32, patch_size=4, embed_dim=512, depth=6, num_heads=8)
 	else:
 		raise ValueError(f"Unknown architecture '{arch}'")
 

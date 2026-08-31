@@ -49,7 +49,6 @@ class VisionTransformer(nn.Module):
             nn.Linear(embed_dim, num_classes),
             nn.GELU(),
             nn.Linear(num_classes, num_classes),
-            nn.Softmax(dim=-1)
         )
 
         # expose embed_dim for compatibility with other code

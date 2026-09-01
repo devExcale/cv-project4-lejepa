@@ -45,12 +45,20 @@ def train_supervised(
 
 	# Use SGD with Cross Entropy Loss
 	criterion = nn.CrossEntropyLoss()
-	optimizer = optim.SGD(
-		model.parameters(),
-		lr=lr,
-		momentum=momentum,
-		weight_decay=weight_decay
-	)
+	if arch == "vit":
+		# For ViT, use AdamW optimizer
+		optimizer = optim.AdamW(
+			model.parameters(),
+			lr=lr,
+			weight_decay=weight_decay
+		)
+	else:
+		optimizer = optim.SGD(
+			model.parameters(),
+			lr=lr,
+			momentum=momentum,
+			weight_decay=weight_decay
+		)
 
 	scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 

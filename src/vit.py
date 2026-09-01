@@ -46,9 +46,11 @@ class VisionTransformer(nn.Module):
 
         # Classification head
         self.head = nn.Sequential(
-            nn.Linear(embed_dim, num_classes),
+            nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
-            nn.Linear(num_classes, num_classes),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim, num_classes),
+
         )
 
         # expose embed_dim for compatibility with other code

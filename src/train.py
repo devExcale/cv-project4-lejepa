@@ -1,3 +1,4 @@
+import math
 import time
 
 import torch
@@ -9,6 +10,15 @@ from tqdm import tqdm
 from src.evaluation import evaluate_model
 from src.globals import CONFIG
 from src.utils import get_checkpoint_path
+
+
+def get_lr_for_epoch(epoch: int, epochs: int, base_lr: float, warmup_epochs: int = 5) -> float:
+	"""Simple warmup + cosine decay schedule for ViT."""
+	if warmup_epochs > 0 and epoch <= warmup_epochs:
+		return base_lr * (epoch / max(1, warmup_epochs))
+	progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
+	progress = min(max(progress, 0.0), 1.0)
+	return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def train_supervised(
@@ -43,14 +53,24 @@ def train_supervised(
 	# Train model on the specified device
 	model = model.to(device)
 
+	# ViT-specific training settings
+	if arch == "vit":
+		label_smoothing = 0.1  # Reduce overconfidence
+		vit_weight_decay = min(weight_decay * 5.0, 0.1)  # Stronger regularization
+		warmup_epochs = max(5, min(10, epochs // 10))  # Adaptive warmup
+	else:
+		label_smoothing = 0.0
+		vit_weight_decay = weight_decay
+		warmup_epochs = 0
+
 	# Use SGD with Cross Entropy Loss
-	criterion = nn.CrossEntropyLoss()
+	
 	if arch == "vit":
 		# For ViT, use AdamW optimizer
 		optimizer = optim.AdamW(
 			model.parameters(),
 			lr=lr,
-			weight_decay=weight_decay
+			weight_decay=vit_weight_decay
 		)
 	else:
 		optimizer = optim.SGD(
@@ -59,7 +79,8 @@ def train_supervised(
 			momentum=momentum,
 			weight_decay=weight_decay
 		)
-
+	
+	criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 	scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
 	best_acc = 0.0
@@ -75,6 +96,13 @@ def train_supervised(
 	start_time = time.time()
 
 	for epoch in range(1, epochs + 1):
+
+		# Update learning rate
+		if arch == "vit":
+			lr_for_epoch = get_lr_for_epoch(epoch, epochs, lr, warmup_epochs=warmup_epochs)
+			for group in optimizer.param_groups:
+				group["lr"] = lr_for_epoch
+
 		model.train()
 		running_loss = 0.0
 		correct = 0
@@ -89,6 +117,8 @@ def train_supervised(
 			outputs = model(images)
 			loss = criterion(outputs, labels)
 			loss.backward()
+			if arch == "vit":
+				nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 			optimizer.step()
 
 			running_loss += loss.item() * images.size(0)
@@ -98,7 +128,8 @@ def train_supervised(
 
 			pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{100.0 * correct / total:.2f}%"})
 
-		scheduler.step()
+		if arch != "vit":
+			scheduler.step()
 
 		train_loss = running_loss / total
 		train_acc = 100.0 * correct / total
@@ -110,11 +141,16 @@ def train_supervised(
 		history["val_loss"].append(val_loss)
 		history["val_acc"].append(val_acc)
 
+		if arch == "vit":
+			current_lr = optimizer.param_groups[0]["lr"]
+		else:
+			current_lr = scheduler.get_last_lr()[0]
+		
 		print(
 			f"Epoch {epoch:03d}/{epochs:03d} | "
 			f"Train Loss: {train_loss:.4f} - Train Acc: {train_acc:.2f}% | "
 			f"Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.2f}% | "
-			f"LR: {scheduler.get_last_lr()[0]:.5f}"
+			f"LR: {current_lr:.5f}"
 		)
 
 		# Save checkpoint if validation accuracy improves

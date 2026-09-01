@@ -2,9 +2,6 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.models.resnet import ResNet, BasicBlock
-
 from src.globals import DATASETS, CONFIG
 
 
@@ -19,7 +16,7 @@ class VisionTransformer(nn.Module):
             depth: int = 6,
             num_heads: int = 8,
             mlp_ratio: float = 4.0,
-            dropout: float = 0.1,
+            dropout: float = 0.15,  # Increased dropout for regularization
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -45,13 +42,15 @@ class VisionTransformer(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
 
         # Classification head
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(embed_dim, num_classes),
-
-        )
+        self.head = nn.Linear(embed_dim, num_classes) 
+        ''' 
+        FeedForward(
+            dim=embed_dim, 
+            hidden_dim=embed_dim,
+            output_dim=num_classes,
+            dropout=dropout
+        ) 
+        '''
 
         # expose embed_dim for compatibility with other code
         self.embed_dim = embed_dim
@@ -107,7 +106,7 @@ class VisionTransformer(nn.Module):
 
 
 class AttentionEncoder(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, dropout: float = 0.1):
+    def __init__(self, embed_dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, dropout: float = 0.0):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -116,15 +115,13 @@ class AttentionEncoder(nn.Module):
 
         # Use batch_first=True so inputs are [B, N, E]
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
-            nn.Dropout(dropout)
+        self.mlp = FeedForward(
+            dim=embed_dim,
+            hidden_dim=int(embed_dim * mlp_ratio),
+            output_dim=embed_dim,
+            dropout=dropout
         )
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Pre-norm: Norm → Attention → Residual
@@ -132,13 +129,25 @@ class AttentionEncoder(nn.Module):
         attn_output, _ = self.attn(x_norm, x_norm, x_norm)
         x = x + attn_output
 
-        # Pre-norm: Norm → MLP → Residual
-        x_norm = self.norm2(x)
-        mlp_output = self.mlp(x_norm)
-        x = x + mlp_output
-
+        normed_mlp_output = self.mlp(x)
+        x = x + normed_mlp_output
         return x
 
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, output_dim, dropout = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 '''
 patch + position embedding:
  patch flattening --> linear projection --> position embedding --> cls token

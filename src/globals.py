@@ -41,11 +41,17 @@ DATASETS: Dict[str, Dict[str, Any]] = {
 CONFIG = {
 	"seed": 42,
 	"batch_size": 64 if not torch.cuda.is_available() else 128,
-	"num_workers": 2 if torch.cuda.is_available() else 0,
+	"num_workers": 4 if torch.cuda.is_available() else 0,
 	"lr": 0.1,
 	"weight_decay": 5e-4,
 	"epochs": 100,
 	"momentum": 0.9,
+
+	"sigreg_slices": 1024,
+	"sigreg_tmax": 3.0,
+	"sigreg_points": 17,
+	"lejepa_lambda": 0.02,
+
 	"device": DEVICE
 }
 

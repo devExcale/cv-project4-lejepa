@@ -55,6 +55,30 @@ def get_class_name(dataset_name: str, class_idx: int) -> str:
 	return f"Class {class_idx}"
 
 
+def spatial_pca(feature_map: torch.Tensor, k: int = 3, image_index: int = 0) -> torch.Tensor:
+	"""PCA over one spatial layer map. H and W are read directly from the actual layer tensor."""
+	if feature_map.ndim != 4:
+		raise ValueError(f"Expected [B, C, H, W], got {tuple(feature_map.shape)}")
+
+	x = feature_map[image_index].detach()  # [C, H, W]
+	c, h, w = x.shape
+	x = x.permute(1, 2, 0).reshape(h * w, c).float()
+	x = x - x.mean(dim=0, keepdim=True)
+	_, _, v = torch.pca_lowrank(x, q=min(k, x.shape[0], x.shape[1]), center=False)
+	projected = x @ v[:, :k]
+	return projected.reshape(h, w, k).cpu()
+
+
+def pca_mask(feature_map: torch.Tensor, image_index: int = 0) -> torch.Tensor:
+	x = spatial_pca(feature_map, k=1, image_index=image_index)[..., 0]
+	return x > x.mean()
+
+
+def pca_rgb(feature_map: torch.Tensor, image_index: int = 0) -> torch.Tensor:
+	x = spatial_pca(feature_map, k=3, image_index=image_index)
+	return (x - x.amin()) / (x.amax() - x.amin() + 1e-8)
+
+
 def evaluate_model(
 		model: nn.Module,
 		val_loader: DataLoader,
@@ -173,3 +197,16 @@ def run_gradcam_pipeline(
 	grad_cam.remove_hooks()
 	print(f"[Grad-CAM Complete] Visualizations saved to: {output_filepath}")
 	return output_filepath
+
+
+def evaluate_lejepa(model: nn.Module, val_loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+	model.eval().to(device)
+	means, stds = [], []
+	with torch.no_grad():
+		for images, _ in val_loader:
+			z = model(images=images.to(device))
+			means.append(z.mean().item())
+			stds.append(z.std().item())
+	print(f"Embedding mean: {sum(means) / len(means):.4f}")
+	print(f"Embedding std:  {sum(stds) / len(stds):.4f}")
+	return sum(means) / len(means), sum(stds) / len(stds)

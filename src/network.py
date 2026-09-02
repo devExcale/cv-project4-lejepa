@@ -68,14 +68,9 @@ def build_model(arch: str, dataset: str, paradigm: str) -> nn.Module:
 		raise ValueError(f"Unknown dataset '{dataset}'. Registered datasets: {list(DATASETS.keys())}")
 
 	num_classes = DATASETS[dataset]["num_classes"]
-	input_size = DATASETS[dataset].get("input_size")
 
 	if arch == "cnn" and paradigm == "std":
-		if input_size == 32:
-			return build_cifar_resnet18(num_classes)
-		if input_size == 224:
-			return resnet18(weights=None, num_classes=num_classes)
-		raise ValueError(f"Unsupported input size '{input_size}' for architecture '{arch}'.")
+		return build_cifar_resnet18(num_classes)
 
 	if arch == "vit":
 		raise NotImplementedError("ViT")

@@ -29,22 +29,12 @@ DATASETS: Dict[str, Dict[str, Any]] = {
 		"hf_path": "uoft-cs/cifar10",
 		"label_key": "label",
 		"num_classes": 10,
-		"input_size": 32,
 	},
 	"cifar100": {
 		"hf_path": "uoft-cs/cifar100",
 		"label_key": "fine_label",
 		"num_classes": 100,
-		"input_size": 32,
-	},
-	"imagenet100": {
-		"hf_path": "clane9/imagenet-100",
-		"label_key": "label",
-		"image_key": "image",
-		"val_split": "validation",
-		"num_classes": 100,
-		"input_size": 224,
-	},
+	}
 }
 
 # Default Hyperparams

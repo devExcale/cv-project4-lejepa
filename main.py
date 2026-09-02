@@ -92,6 +92,11 @@ def parse_args():
 		default=-1,
 		help="Layer index for PCA (default: last)"
 	)
+	parser.add_argument(
+		"-r", "--resume",
+		action="store_true",
+		help="Resume training from checkpoint (if available)"
+	)
 	return parser.parse_args()
 
 
@@ -148,7 +153,8 @@ def main():
 				args.arch,
 				epochs=args.epochs,
 				lr=args.lr or 1e-3,
-				device=device
+				device=device,
+				resume=args.resume,
 			)
 		elif args.paradigm == "std":
 			train_supervised(
@@ -160,7 +166,8 @@ def main():
 				args.paradigm,
 				epochs=args.epochs,
 				lr=args.lr or CONFIG["lr"],
-				device=device
+				device=device,
+				resume=args.resume,
 			)
 		else:
 			raise ValueError(f"Unknown training paradigm '{args.paradigm}.'")

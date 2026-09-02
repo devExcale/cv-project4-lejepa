@@ -1,4 +1,5 @@
 import math
+import os
 import time
 
 import torch
@@ -32,7 +33,8 @@ def train_supervised(
 		lr: float = CONFIG["lr"],
 		weight_decay: float = CONFIG["weight_decay"],
 		momentum: float = CONFIG["momentum"],
-		device: torch.device = CONFIG["device"]
+		device: torch.device = CONFIG["device"],
+		resume: bool = False,
 ) -> dict:
 	"""
 	Execute standard supervised training loop with best-accuracy checkpointing.
@@ -47,6 +49,7 @@ def train_supervised(
 	:param weight_decay: Weight decay for optimizer
 	:param momentum: Momentum for optimizer
 	:param device: Device to run training on (e.g., 'cuda', 'cpu')
+	:param resume: If True, load the best checkpoint and resume training
 	:return: Dictionary containing training history (loss and accuracy)
 	"""
 
@@ -63,10 +66,8 @@ def train_supervised(
 		vit_weight_decay = weight_decay
 		warmup_epochs = 0
 
-	# Use SGD with Cross Entropy Loss
-	
+	# Optimizer setup
 	if arch == "vit":
-		# For ViT, use AdamW optimizer
 		optimizer = optim.AdamW(
 			model.parameters(),
 			lr=lr,
@@ -79,25 +80,62 @@ def train_supervised(
 			momentum=momentum,
 			weight_decay=weight_decay
 		)
-	
+
 	criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 	scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
 	best_acc = 0.0
+	start_epoch = 1
 	best_ckpt_path = get_checkpoint_path(dataset=dataset_name, arch=arch, paradigm=paradigm, tag="best")
 	history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+
+	if resume:
+		if os.path.exists(best_ckpt_path):
+
+			print(f"Resume] Found checkpoint at `{best_ckpt_path}`. Loading states...")
+			checkpoint = torch.load(best_ckpt_path, map_location=device)
+
+			# Restore model and optimizer weights
+			model.load_state_dict(checkpoint["model_state_dict"])
+			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+			# Restore training tracking variables
+			saved_epoch = checkpoint.get("epoch", 0)
+			start_epoch = saved_epoch + 1
+			best_acc = checkpoint.get("val_acc", 0.0)
+			history = checkpoint.get("history", history)
+
+			# Align learning rate scheduler for non-ViT architectures
+			if arch != "vit":
+				if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
+					scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+				else:
+					# Fast-forward scheduler steps to match the resumed epoch
+					for _ in range(saved_epoch):
+						scheduler.step()
+
+			print(
+				f"Successfully loaded checkpoint. "
+				f"Resuming from Epoch {start_epoch}/{epochs} (Best Val Acc so far: {best_acc:.2f}%)"
+			)
+
+			if start_epoch > epochs:
+				print(f"[Resume] Model has already completed all {epochs} epochs.")
+				return history
+		else:
+			print(f"No checkpoint found at `{best_ckpt_path}`, training from scratch.")
 
 	print(
 		f"\n[Starting Training] Dataset: {dataset_name.upper()}"
 		f" | Arch: {arch.upper()}"
-		f" | Epochs: {epochs}"
+		f" | Epochs: {start_epoch} -> {epochs}"
 		f" | Device: {device}"
 	)
 	start_time = time.time()
 
-	for epoch in range(1, epochs + 1):
+	for epoch in range(start_epoch, epochs + 1):
 
-		# Update learning rate
+		# Update learning rate for ViT
 		if arch == "vit":
 			lr_for_epoch = get_lr_for_epoch(epoch, epochs, lr, warmup_epochs=warmup_epochs)
 			for group in optimizer.param_groups:
@@ -145,7 +183,7 @@ def train_supervised(
 			current_lr = optimizer.param_groups[0]["lr"]
 		else:
 			current_lr = scheduler.get_last_lr()[0]
-		
+
 		print(
 			f"Epoch {epoch:03d}/{epochs:03d} | "
 			f"Train Loss: {train_loss:.4f} - Train Acc: {train_acc:.2f}% | "
@@ -160,6 +198,7 @@ def train_supervised(
 				"epoch": epoch,
 				"model_state_dict": model.state_dict(),
 				"optimizer_state_dict": optimizer.state_dict(),
+				"scheduler_state_dict": scheduler.state_dict() if arch != "vit" else None,
 				"val_acc": best_acc,
 				"history": history,
 				"dataset": dataset_name,
@@ -173,6 +212,7 @@ def train_supervised(
 
 	return history
 
+
 def train_lejepa(
 		model,
 		train_loader,
@@ -181,16 +221,48 @@ def train_lejepa(
 		epochs=CONFIG["epochs"],
 		lr=1e-3,
 		weight_decay=CONFIG["weight_decay"],
-		device=CONFIG["device"]
-):
+		device=CONFIG["device"],
+		resume: bool = False,
+) -> dict:
+
 	model = model.to(device)
 	optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 	best_loss = float("inf")
+	start_epoch = 1
 	best_ckpt_path = get_checkpoint_path(dataset_name, arch, "lejepa", "best")
 	history = {"loss": [], "invariance": [], "sigreg": []}
 
-	for epoch in range(1, epochs + 1):
+	# ----------------------------------------------------
+	# Resume checkpoint logic
+	# ----------------------------------------------------
+	if resume:
+		if os.path.exists(best_ckpt_path):
+			print(f"[Resume] Found checkpoint at `{best_ckpt_path}`. Loading states...")
+			checkpoint = torch.load(best_ckpt_path, map_location=device)
+
+			# Restore weights and optimizer state
+			model.load_state_dict(checkpoint["model_state_dict"])
+			optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+			# Restore training tracking variables
+			saved_epoch = checkpoint.get("epoch", 0)
+			start_epoch = saved_epoch + 1
+			best_loss = checkpoint.get("loss", float("inf"))
+			history = checkpoint.get("history", history)
+
+			print(
+				f"[Resume] Successfully loaded checkpoint. "
+				f"Resuming from Epoch {start_epoch}/{epochs} (Best Loss so far: {best_loss:.4f})"
+			)
+
+			if start_epoch > epochs:
+				print(f"[Resume] Model has already completed all {epochs} epochs. Exiting training.")
+				return history
+		else:
+			print(f"[Resume] Warning: No checkpoint found at `{best_ckpt_path}`. Training from scratch.")
+
+	for epoch in range(start_epoch, epochs + 1):
 		model.train()
 		total_loss = total_inv = total_sig = 0.0
 
@@ -219,6 +291,7 @@ def train_lejepa(
 
 		print(f"Epoch {epoch:03d}/{epochs:03d} | Loss {values[0]:.4f} | Inv {values[1]:.4f} | SIGReg {values[2]:.4f}")
 
+		# Save checkpoint if loss improves
 		if values[0] < best_loss:
 			best_loss = values[0]
 			torch.save({
@@ -232,4 +305,5 @@ def train_lejepa(
 				"paradigm": "lejepa"
 			}, best_ckpt_path)
 			print(f"--> Saved new best checkpoint to `{best_ckpt_path}` (Loss: {best_loss:.4f})")
+
 	return history

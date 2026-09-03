@@ -1,14 +1,17 @@
 import glob
+import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.utils import save_image
 
-from src.data import get_dataloaders
-from src.globals import DEVICE, CONFIG, DATASETS, set_seed, DIR_CHECKPOINTS
+from src.data import get_dataloaders, get_or_compute_stats
+from src.evaluation import linear_probe, pca_outputs
+from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, DIR_OUTPUT, set_seed
 from src.network import build_model
 
 
@@ -139,226 +142,297 @@ class GradCAM:
 		self.backward_handle.remove()
 
 
-class MilestoneCheckpointer:
-	"""
-	Manages:
-	1. The overall best model checkpoint (for resuming and optimal evaluation).
-	2. Accuracy milestone checkpoints grouped by milestone folders:
-		e.g., checkpoints/30/{dataset}_{arch}_{paradigm}_29.5.pt
-		Keeps strictly the closest model to each milestone centroid.
-	"""
-
-	DEFAULT_MILESTONES: List[int] = [15, 30, 45, 60, 75, 90]
-
-	def __init__(
-			self,
-			dataset: str,
-			arch: str,
-			paradigm: str,
-			milestones: Optional[List[int]] = None,
-			base_dir: str = DIR_CHECKPOINTS,
-	):
-		self.dataset = dataset
-		self.arch = arch
-		self.paradigm = paradigm
-		self.base_dir = base_dir
-		self.milestones = milestones or self.DEFAULT_MILESTONES
-		self.best_acc: float = 0.0
-
-		# Map milestone -> {"acc": float, "diff": float, "path": str}
-		self.milestone_records: Dict[int, Dict[str, Any]] = {}
-		self._sync_existing_milestone_files()
-
-	@property
-	def base_name(self) -> str:
-		"""
-		Constructs a base filename for checkpoints based on dataset, architecture, and paradigm.
-		:return: A string in the format "{dataset}_{arch}_{paradigm}".
-		"""
-		return f"{self.dataset}_{self.arch}_{self.paradigm}"
-
-	@property
-	def best_path(self) -> str:
-		"""
-		Constructs the path to the best checkpoint file.
-		:return: A string representing the path to the best checkpoint.
-		"""
-		return os.path.join(self.base_dir, f"{self.base_name}_best.pt")
-
-	def get_milestone_dir(self, milestone: int) -> str:
-		"""
-		Constructs the directory path for a specific milestone.
-		:param milestone: The milestone value (e.g., 30 for 30% accuracy).
-		:return: A string representing the path to the milestone directory.
-		"""
-		return os.path.join(self.base_dir, str(milestone))
-
-	def get_milestone_path(self, milestone: int, acc: float) -> str:
-		"""
-		Constructs the full path for a checkpoint corresponding to a specific milestone and accuracy.
-		:param milestone: The milestone value (e.g., 30 for 30% accuracy).
-		:param acc: The accuracy of the checkpoint.
-		:return: A string representing the path to the checkpoint.
-		"""
-		return os.path.join(self.get_milestone_dir(milestone), f"{self.base_name}_{acc:.1f}.pt")
-
-	def _sync_existing_milestone_files(self) -> None:
-		"""
-		Inspects disk for existing checkpoints to preserve closest distance records across restarts.
-		"""
-
-		# Scan each milestone
-		for m in self.milestones:
-
-			# Get milestone directory
-			m_dir = self.get_milestone_dir(m)
-			if not os.path.isdir(m_dir):
-				continue
-
-			# Look for checkpoints in milestone directory
-			pattern = os.path.join(m_dir, f"{self.base_name}_*.pt")
-			for filepath in glob.glob(pattern):
-				try:
-
-					# Extract accuracy from filename (e.g. cifar10_cnn_std_29.5.pt -> 29.5)
-					acc_str = os.path.splitext(filepath)[0].rsplit("_", 1)[-1]
-					acc = float(acc_str)
-					diff = abs(acc - m)
-
-					# Register checkpoint closest to milestone
-					if m not in self.milestone_records or diff < self.milestone_records[m]["diff"]:
-						self.milestone_records[m] = {"acc": acc, "diff": diff, "path": filepath}
-
-				except ValueError:
-					continue
-		return
-
-	def load_best(
-			self,
-			model: nn.Module,
-			optimizer: torch.optim.Optimizer,
-			scheduler: Optional[Any] = None,
-			default_history: Optional[Dict[str, list]] = None,
-			device: torch.device = torch.device("cpu"),
-	) -> Tuple[int, float, Dict[str, list]]:
-		"""
-		Restores model, optimizer, scheduler, and history from the best checkpoint.
-		:param model: PyTorch model to load state into
-		:param optimizer: PyTorch optimizer to load state into
-		:param scheduler: Optional learning rate scheduler to load state into
-		:param default_history: Optional default history dictionary to use if no checkpoint is found
-		:param device: Device to map the checkpoint to (default: CPU)
-		:return: Tuple containing (start_epoch, best_val_acc, history)
-		"""
-
-		# Check if the best checkpoint exists
-		if not os.path.exists(self.best_path):
-			print(f"[Resume] No checkpoint found at `{self.best_path}`. Training from scratch.")
-			return 1, 0.0, default_history or {}
-
-		# Load the best checkpoint
-		print(f"[Resume] Found checkpoint at `{self.best_path}`. Loading states...")
-		ckpt = torch.load(self.best_path, map_location=device)
-
-		model.load_state_dict(ckpt["model_state_dict"])
-		optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-
-		saved_epoch = ckpt.get("epoch", 0)
-		self.best_acc = ckpt.get("val_acc", 0.0)
-		history = ckpt.get("history", default_history or {})
-		start_epoch = saved_epoch + 1
-
-		# Restore scheduler state if available, otherwise step it to the saved epoch
-		if scheduler is not None:
-			if ckpt.get("scheduler_state_dict"):
-				scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-			else:
-				for _ in range(saved_epoch):
-					scheduler.step()
-
-		print(
-			f"[Resume] Successfully loaded checkpoint. "
-			f"Resuming from Epoch {start_epoch} (Best Val Acc so far: {self.best_acc:.2f}%)"
-		)
-
-		return start_epoch, self.best_acc, history
-
-	def step(
-			self,
-			epoch: int,
-			val_acc: float,
-			model: nn.Module,
-			optimizer: torch.optim.Optimizer,
-			history: Dict[str, list],
-			scheduler: Optional[Any] = None,
-	) -> None:
-		"""
-		Evaluates val_acc against both the overall best and the closest milestone centroid.
-		:param epoch: Current epoch
-		:param val_acc: Current validation accuracy
-		:param model: PyTorch model
-		:param optimizer: PyTorch optimizer
-		:param history: Training history
-		:param scheduler: Optional learning rate scheduler
-		"""
-
-		checkpoint_data = {
-			"epoch": epoch,
-			"model_state_dict": model.state_dict(),
-			"optimizer_state_dict": optimizer.state_dict(),
-			"scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-			"val_acc": val_acc,
-			"history": history,
-			"dataset": self.dataset,
-			"arch": self.arch,
-			"paradigm": self.paradigm,
-		}
-
-		# Update overall best checkpoint
-		if val_acc > self.best_acc:
-			self.best_acc = val_acc
-			torch.save(checkpoint_data, self.best_path)
-			print(f"--> Saved new best checkpoint to `{self.best_path}` (Val Acc: {self.best_acc:.2f}%)")
-
-		# Update closest milestone checkpoint
-		target_milestone = min(self.milestones, key=lambda c: abs(c - val_acc))
-		current_diff = abs(val_acc - target_milestone)
-
-		is_new_closest = (
-				target_milestone not in self.milestone_records
-				or current_diff < self.milestone_records[target_milestone]["diff"]
-		)
-
-		if is_new_closest:
-			# Remove previous checkpoint for this milestone if it had a different accuracy name
-			old_record = self.milestone_records.get(target_milestone)
-			if old_record and os.path.exists(old_record["path"]):
-				try:
-					os.remove(old_record["path"])
-				except OSError:
-					pass
-
-			target_dir = self.get_milestone_dir(target_milestone)
-			os.makedirs(target_dir, exist_ok=True)
-
-			new_path = self.get_milestone_path(target_milestone, val_acc)
-			torch.save(checkpoint_data, new_path)
-
-			self.milestone_records[target_milestone] = {
-				"acc": val_acc,
-				"diff": current_diff,
-				"path": new_path,
-			}
-			print(
-				f"--> [Milestone {int(target_milestone)}%] Saved closest checkpoint to `{new_path}` "
-				f"(Val Acc: {val_acc:.2f}%, Diff: {current_diff:.2f}%)"
-			)
-
-		return
+MILESTONE_PCTS = [15, 30, 45, 60, 75, 90]
 
 
 def get_checkpoint_path(dataset: str, arch: str, paradigm: str, tag: str = "best") -> str:
 	return os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_{paradigm}_{tag}.pt")
+
+
+def list_periodic_checkpoints(dataset: str, arch: str, paradigm: str) -> List[str]:
+	pattern = os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_{paradigm}_epoch_*.pt")
+	return sorted(glob.glob(pattern))
+
+
+def _epoch_from_checkpoint(path: str) -> int:
+	return int(os.path.splitext(path)[0].rsplit("_", 1)[-1])
+
+
+def select_and_prune_milestones(
+	dataset: str,
+	arch: str,
+	paradigm: str,
+	batch_size: int,
+	device: torch.device,
+	val_fraction: float = CONFIG["val_fraction"],
+	probe_epochs: int = CONFIG["probe_epochs"],
+	probe_lr: float = CONFIG["probe_lr"],
+	num_slices: int = CONFIG["sigreg_slices"],
+	t_max: float = CONFIG["sigreg_tmax"],
+	n_points: int = CONFIG["sigreg_points"],
+	lamb: float = CONFIG["lejepa_lambda"],
+) -> Dict:
+	"""Load all periodic checkpoints, probe them, select relative milestones, and prune the rest."""
+	paths = list_periodic_checkpoints(dataset, arch, paradigm)
+	if not paths:
+		raise FileNotFoundError(
+			f"No periodic checkpoints found for {dataset}/{arch}/{paradigm}. "
+			"Train first, or point this project at the checkpoint directory containing the periodic files."
+		)
+
+	set_seed(CONFIG["seed"])
+	probe_train, probe_val, probe_test = get_dataloaders(
+		dataset,
+		batch_size=batch_size,
+		paradigm="std",
+		val_fraction=val_fraction,
+		include_test=True,
+	)
+
+	records = []
+	for path in paths:
+		epoch = _epoch_from_checkpoint(path)
+		model = build_model(
+			arch,
+			dataset,
+			paradigm,
+			num_slices=num_slices,
+			t_max=t_max,
+			n_points=n_points,
+			lamb=lamb,
+		).to(device)
+		checkpoint = torch.load(path, map_location=device)
+		model.load_state_dict(checkpoint["model_state_dict"])
+
+		print(f"[Probe] Epoch {epoch}: {path}")
+		result = linear_probe(
+			model,
+			probe_train,
+			probe_val,
+			probe_test,
+			num_classes=DATASETS[dataset]["num_classes"],
+			device=device,
+			epochs=probe_epochs,
+			lr=probe_lr,
+		)
+
+		records.append({
+			"epoch": epoch,
+			"path": path,
+			"val_acc": float(result["best_val_acc"]),
+			"test_acc": float(result["test_acc"]),
+			"probe_best_epoch": int(result["best_epoch"]),
+			"head_state_dict": result["head_state_dict"],
+		})
+
+		del model
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+
+	# The best representation checkpoint is chosen only from probe validation accuracy.
+	# Test accuracy is stored for reporting and never used for checkpoint selection.
+	best = max(records, key=lambda record: (record["val_acc"], -record["epoch"]))
+	chance = 100.0 / DATASETS[dataset]["num_classes"]
+	accuracy_final = best["val_acc"]
+
+	milestone_map = {}
+	for milestone in MILESTONE_PCTS:
+		target = chance + (milestone / 100.0) * (accuracy_final - chance)
+		chosen = min(
+			records,
+			key=lambda record: (abs(record["val_acc"] - target), record["epoch"]),
+		)
+		milestone_map[milestone] = {
+			"target_val_acc": target,
+			"epoch": chosen["epoch"],
+			"val_acc": chosen["val_acc"],
+			"test_acc": chosen["test_acc"],
+		}
+
+	# Several relative milestones may legitimately map to the same periodic checkpoint.
+	labels_by_epoch = {}
+	for milestone, info in milestone_map.items():
+		labels_by_epoch.setdefault(info["epoch"], []).append(milestone)
+
+	# Retain every milestone checkpoint and the checkpoint with the best probe validation accuracy.
+	# The separate *_best.pt recovery checkpoint is not part of this pruning process.
+	keep_epochs = set(labels_by_epoch) | {best["epoch"]}
+	retained = []
+
+	for record in records:
+		if record["epoch"] not in keep_epochs:
+			os.remove(record["path"])
+			continue
+
+		checkpoint = torch.load(record["path"], map_location="cpu")
+		checkpoint["linear_probe"] = {
+			"best_val_acc": record["val_acc"],
+			"test_acc": record["test_acc"],
+			"best_probe_epoch": record["probe_best_epoch"],
+			"head_state_dict": record["head_state_dict"],
+		}
+		checkpoint["milestones"] = sorted(labels_by_epoch.get(record["epoch"], []))
+		checkpoint["is_best_probe_checkpoint"] = record["epoch"] == best["epoch"]
+		torch.save(checkpoint, record["path"])
+		retained.append(record["path"])
+
+	summary = {
+		"dataset": dataset,
+		"arch": arch,
+		"paradigm": paradigm,
+		"chance_accuracy": chance,
+		"accuracy_final": accuracy_final,
+		"best_epoch": best["epoch"],
+		"best_val_acc": best["val_acc"],
+		"best_test_acc": best["test_acc"],
+		"model_config": {
+			"num_slices": num_slices,
+			"t_max": t_max,
+			"n_points": n_points,
+			"lamb": lamb,
+		},
+		"milestones": milestone_map,
+		"retained_checkpoints": retained,
+		"all_probe_results": [
+			{key: value for key, value in record.items() if key != "head_state_dict"}
+			for record in records
+		],
+	}
+
+	summary_path = os.path.join(
+		DIR_CHECKPOINTS,
+		f"{dataset}_{arch}_{paradigm}_milestones.json",
+	)
+	with open(summary_path, "w") as file:
+		json.dump(summary, file, indent=2)
+
+	print(f"[Milestones] Summary saved to {summary_path}")
+	return summary
+
+
+def denormalize(images: torch.Tensor, dataset_name: str) -> torch.Tensor:
+	mean, std = get_or_compute_stats(dataset_name)
+	mean_tensor = torch.tensor(mean, dtype=images.dtype).view(1, -1, 1, 1)
+	std_tensor = torch.tensor(std, dtype=images.dtype).view(1, -1, 1, 1)
+	return (images.cpu() * std_tensor + mean_tensor).clamp(0, 1)
+
+
+def run_pca_for_milestones(
+	summary: Dict,
+	batch_size: int,
+	device: torch.device,
+	num_samples: int,
+	val_fraction: float = CONFIG["val_fraction"],
+):
+	"""Run the original SVD-based spatial PCA on a fixed test subset for every milestone checkpoint."""
+	if num_samples < 1:
+		return
+
+	dataset = summary["dataset"]
+	arch = summary["arch"]
+	paradigm = summary["paradigm"]
+	model_config = summary.get("model_config", {})
+
+	_, _, test_loader = get_dataloaders(
+		dataset,
+		batch_size=batch_size,
+		paradigm="std",
+		val_fraction=val_fraction,
+		include_test=True,
+	)
+
+	milestone_epochs = sorted({info["epoch"] for info in summary["milestones"].values()})
+
+	for epoch in milestone_epochs:
+		path = next(
+			checkpoint_path
+			for checkpoint_path in summary["retained_checkpoints"]
+			if _epoch_from_checkpoint(checkpoint_path) == epoch
+		)
+
+		checkpoint = torch.load(path, map_location=device)
+		model = build_model(
+			arch,
+			dataset,
+			paradigm,
+			num_slices=model_config.get("num_slices", CONFIG["sigreg_slices"]),
+			t_max=model_config.get("t_max", CONFIG["sigreg_tmax"]),
+			n_points=model_config.get("n_points", CONFIG["sigreg_points"]),
+			lamb=model_config.get("lamb", CONFIG["lejepa_lambda"]),
+		).to(device)
+		model.load_state_dict(checkpoint["model_state_dict"])
+		model.eval()
+
+		milestone_labels = sorted(checkpoint.get("milestones", []))
+		output_root = os.path.join(
+			DIR_OUTPUT,
+			"pca",
+			dataset,
+			f"{arch}_{paradigm}",
+			f"epoch_{epoch:04d}_milestones_{'-'.join(map(str, milestone_labels))}",
+		)
+
+		saved = 0
+		sample_index = 0
+		num_layers = None
+
+		with torch.no_grad():
+			for images, labels in test_loader:
+				remaining = num_samples - saved
+				if remaining <= 0:
+					break
+
+				images = images[:remaining]
+				labels = labels[:remaining]
+				features = model.forward_features(images.to(device, non_blocking=True))
+				originals = denormalize(images, dataset)
+				num_layers = len(features)
+
+				for batch_index in range(images.size(0)):
+					for layer_index, feature_map in enumerate(features):
+						result = pca_outputs(feature_map, image_index=batch_index)
+						result_dir = os.path.join(
+							output_root,
+							f"layer_{layer_index:02d}",
+							f"sample_{sample_index:05d}",
+						)
+						os.makedirs(result_dir, exist_ok=True)
+
+						metadata = {
+							"dataset": dataset,
+							"sample_index": sample_index,
+							"label": int(labels[batch_index]),
+							"architecture": arch,
+							"paradigm": paradigm,
+							"epoch": epoch,
+							"milestones": milestone_labels,
+							"layer_index": layer_index,
+							"pca_components": 3,
+							"checkpoint_path": path,
+						}
+
+						payload = {
+							"original": originals[batch_index],
+							"components": result["components"],
+							"mask": result["mask"],
+							"rgb": result["rgb"],
+							"metadata": metadata,
+						}
+
+						torch.save(payload, os.path.join(result_dir, "pca.pt"))
+						save_image(originals[batch_index], os.path.join(result_dir, "original.png"))
+						save_image(result["rgb"].permute(2, 0, 1), os.path.join(result_dir, "pca_rgb.png"))
+						save_image(result["mask"].float().unsqueeze(0), os.path.join(result_dir, "pca_mask.png"))
+						with open(os.path.join(result_dir, "metadata.json"), "w") as file:
+							json.dump(metadata, file, indent=2)
+
+					sample_index += 1
+					saved += 1
+
+		print(
+			f"[PCA] Epoch {epoch}: saved {saved} test samples "
+			f"across {num_layers} feature layers to '{output_root}'."
+		)
 
 
 def test_cuda():
@@ -375,14 +449,12 @@ def test_config(dataset: str, arch: str, paradigm: str):
 	print(f"Architecture:        {arch}")
 	print(f"Training Paradigm:   {paradigm}")
 	print(f"Number of Classes:   {DATASETS[dataset]['num_classes']}")
-	print(f"Checkpoint Target:   {get_checkpoint_path(dataset, arch, paradigm)}")
 
 
 def test_pipeline(dataset: str, arch: str, paradigm: str):
 	train_loader, _ = get_dataloaders(dataset_name=dataset, batch_size=8, paradigm=paradigm)
-	batch, labels = next(iter(train_loader))
+	batch, _ = next(iter(train_loader))
 	model = build_model(arch=arch, dataset=dataset, paradigm=paradigm).to(DEVICE)
-
 	if paradigm == "lejepa":
 		global_views = [x.to(DEVICE) for x in batch["global"]]
 		local_views = [x.to(DEVICE) for x in batch["local"]]
@@ -392,7 +464,5 @@ def test_pipeline(dataset: str, arch: str, paradigm: str):
 	else:
 		images = batch.to(DEVICE)
 		print(f"Logits output shape: {model(images).shape}")
-
-	features = model.forward_features(images)
-	for i, feature in enumerate(features, 1):
+	for i, feature in enumerate(model.forward_features(images), 1):
 		print(f"Layer {i} feature shape: {tuple(feature.shape)}")

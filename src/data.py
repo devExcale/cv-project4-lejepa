@@ -170,56 +170,43 @@ def get_lejepa_transforms(dataset_name: str):
 
 
 def get_dataloaders(
-		dataset_name: str,
-		batch_size: int = CONFIG["batch_size"],
-		num_workers: int = CONFIG["num_workers"],
-		data_dir: str = DIR_DATA,
-		paradigm: str = "std",
+    dataset_name: str,
+    batch_size: int = CONFIG["batch_size"],
+    num_workers: int = CONFIG["num_workers"],
+    data_dir: str = DIR_DATA,
+    paradigm: str = "std",
+    val_fraction: float = CONFIG["val_fraction"],
+    seed: int = CONFIG["seed"],
+    include_test: bool = False,
 ):
-	train_transform, val_transform = get_transforms(dataset_name)
+    if paradigm not in ("std", "lejepa"):
+        raise ValueError("Unrecognized paradigm.")
+    
+    meta_data = DATASETS[dataset_name]
+    raw_data = load_dataset(meta_data["hf_path"], split="train", cache_dir=data_dir)
+    try:
+        splits = raw_data.train_test_split(test_size=val_fraction, seed=seed, stratify_by_column=meta_data["label_key"])
+    except (ValueError, TypeError):
+        splits = raw_data.train_test_split(test_size=val_fraction, seed=seed)
 
-	if paradigm == "lejepa":
-		global_transform, local_transform = get_lejepa_transforms(dataset_name)
-		train_dataset = MultiViewDataset(
-			dataset_name,
-			global_transform,
-			local_transform,
-			split="train",
-			data_dir=data_dir
-		)
-	else:
-		train_dataset = HuggingFaceDataset(
-			dataset_name,
-			split="train",
-			transform=train_transform,
-			data_dir=data_dir
-		)
+    train_transform, eval_transform = get_transforms(dataset_name)
+    if paradigm == "std":
+        train_dataset = HuggingFaceDataset(dataset_name, transform=train_transform, data_dir=data_dir, dataset=splits["train"])
+    else:
+        global_transform, local_transform = get_lejepa_transforms(dataset_name)
+        train_dataset = MultiViewDataset(dataset_name, global_transform, local_transform, data_dir=data_dir, dataset=splits["train"])
+    #For LeJEPA this validation dataset will be used to test the linear probe.
+    val_dataset = HuggingFaceDataset(dataset_name, transform=eval_transform, data_dir=data_dir, dataset=splits["test"])
 
-	val_dataset = HuggingFaceDataset(
-		dataset_name,
-		split="test",
-		transform=val_transform,
-		data_dir=data_dir
-	)
+    is_cuda = torch.cuda.is_available()
+    common_loader = dict(num_workers=num_workers, pin_memory=is_cuda, persistent_workers=num_workers > 0)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, **common_loader)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False, **common_loader)
 
-	is_cuda = torch.cuda.is_available()
+    if not include_test:
+        return train_loader, val_loader
 
-	train_loader = DataLoader(
-		train_dataset,
-		batch_size=batch_size,
-		shuffle=True,
-		num_workers=num_workers,
-		pin_memory=is_cuda,
-		persistent_workers=num_workers > 0,
-		drop_last=True
-	)
-	val_loader = DataLoader(
-		val_dataset,
-		batch_size=batch_size,
-		shuffle=False,
-		num_workers=num_workers,
-		pin_memory=is_cuda,
-		drop_last=False
-	)
+    test_dataset = HuggingFaceDataset(dataset_name, split="test", transform=eval_transform, data_dir=data_dir)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=False, **common_loader)
+    return train_loader, val_loader, test_loader
 
-	return train_loader, val_loader

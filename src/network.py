@@ -41,7 +41,14 @@ class CIFARResNet18(ResNet):
 
 
 class VisionTransformer(nn.Module):
-    """CIFAR-scale ViT using the newer encoder/feed-forward design."""
+    '''
+	patch + position embedding:
+	patch flattening --> linear projection --> position embedding --> cls token
+	encoder:
+	norm --> multihead attention --> residual connection --> norm --> MLP --> residual connection --> norm  XL
+	classification head:
+	MLP --> softmax
+	'''
 
     def __init__(
         self,
@@ -120,80 +127,63 @@ class VisionTransformer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.forward_embedding(x))
 
-
-    def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """
-        Return a tuple of spatial feature maps. For the ViT we return a single
-        feature map obtained by reshaping token embeddings back to a grid:
-        [B, embed_dim, H_patch, W_patch]
-        """
-        B = x.size(0)
-        x = self.patch_embed(x)                       # [B, C, Hp, Wp]
-        _, C, Hp, Wp = x.shape
-        tokens = x.flatten(2).transpose(1, 2)        # [B, N, C]
-
-        cls = self.cls_token.expand(B, -1, -1)      # [B, 1, C]
-        tokens = torch.cat((cls, tokens), dim=1)     # [B, N+1, C]
-        tokens = tokens + self.pos_embed
-        tokens = self.pos_drop(tokens)
-
-        for blk in self.encoder:
-            tokens = blk(tokens)
-
-        # remove cls token and reshape tokens to spatial map
-        tok = tokens[:, 1:, :].transpose(1, 2).reshape(B, C, Hp, Wp)
-        return (tok,)
-
-    def forward_embedding(self, x: torch.Tensor) -> torch.Tensor:
-        """Return pooled embedding (cls token)"""
-        B = x.size(0)
-        x = self.patch_embed(x)
-        _, C, Hp, Wp = x.shape
-        tokens = x.flatten(2).transpose(1, 2)
-        cls = self.cls_token.expand(B, -1, -1)
-        tokens = torch.cat((cls, tokens), dim=1)
-        tokens = tokens + self.pos_embed
-        tokens = self.pos_drop(tokens)
-
-        for blk in self.encoder:
-            tokens = blk(tokens)
-
-        cls_tok = tokens[:, 0, :]
-        cls_tok = self.norm(cls_tok)
-        return cls_tok
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        emb = self.forward_embedding(x)
-        return self.head(emb)
-
-
 class AttentionEncoder(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, dropout: float = 0.0):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.mlp_ratio = mlp_ratio
-        self.dropout = dropout
+	def __init__(self, embed_dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, dropout: float = 0.0):
+		super().__init__()
+		if embed_dim % num_heads != 0:
+			raise ValueError("embed_dim must be divisible by num_heads")
 
-        # Use batch_first=True so inputs are [B, N, E]
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-        self.mlp = FeedForward(
-            dim=embed_dim,
-            hidden_dim=int(embed_dim * mlp_ratio),
-            output_dim=embed_dim,
-            dropout=dropout
-        )
-        self.norm1 = nn.LayerNorm(embed_dim)
+		self.embed_dim = embed_dim
+		self.num_heads = num_heads
+		self.mlp_ratio = mlp_ratio
+		self.dropout = dropout
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Pre-norm: Norm → Attention → Residual
-        x_norm = self.norm1(x)
-        attn_output, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + attn_output
+		self.qkv = nn.Linear(embed_dim, 3 * embed_dim)
+		self.out_proj = nn.Linear(embed_dim, embed_dim)
+		self.mlp = FeedForward(
+			dim=embed_dim,
+			hidden_dim=int(embed_dim * mlp_ratio),
+			output_dim=embed_dim,
+			dropout=dropout,
+		)
+		self.norm1 = nn.LayerNorm(embed_dim)
+		self.norm2 = nn.LayerNorm(embed_dim)
 
-        normed_mlp_output = self.mlp(x)
-        x = x + normed_mlp_output
-        return x
+	def self_attention(self, x: torch.Tensor) -> torch.Tensor:
+		"""Esegue l'attenzione esplicita mantenendo i pesi per-head per GMAR."""
+		batch_size, num_tokens, _ = x.shape
+		head_dim = self.embed_dim // self.num_heads
+
+		# Calcolo Q, K, V
+		qkv = self.qkv(x)
+		query, key, value = qkv.chunk(3, dim=-1)
+
+		query = query.view(batch_size, num_tokens, self.num_heads, head_dim).transpose(1, 2)
+		key = key.view(batch_size, num_tokens, self.num_heads, head_dim).transpose(1, 2)
+		value = value.view(batch_size, num_tokens, self.num_heads, head_dim).transpose(1, 2)
+
+		# Scaled Dot-Product Attention
+		scale = head_dim ** -0.5
+		attn_matrix = torch.matmul(query, key.transpose(-2, -1)) * scale
+		attn_weights = torch.softmax(attn_matrix, dim=-1)
+
+		# Salva il tensore per la backprop/GMAR prima del il dropout
+		if attn_weights.requires_grad:
+			attn_weights.retain_grad()
+		self.attention = attn_weights
+
+		# Applica dropout per il forward pass
+		attn_dropped = F.dropout(attn_weights, p=self.dropout, training=self.training)
+
+		output = torch.matmul(attn_dropped, value)
+		output = output.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.embed_dim)
+		
+		return self.out_proj(output)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		x = x + self.self_attention(self.norm1(x))
+		x = x + self.mlp(self.norm2(x))
+		return x
 
 
 class FeedForward(nn.Module):

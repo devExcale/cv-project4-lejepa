@@ -12,7 +12,7 @@ from torchvision.utils import save_image
 from src.data import get_dataloaders, get_or_compute_stats
 from src.evaluation import linear_probe, pca_outputs
 from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, DIR_OUTPUT, set_seed
-from src.network import build_model
+from src.network import AttentionEncoder, build_model
 
 
 class GuidedBackprop:
@@ -140,6 +140,80 @@ class GradCAM:
 		"""Clean up PyTorch hooks."""
 		self.forward_handle.remove()
 		self.backward_handle.remove()
+
+class GMAR:
+	def __init__(self, model: nn.Module):
+		self.model = model
+		self.attn_modules = [
+			module for module in self.model.modules()
+			if isinstance(module, AttentionEncoder)
+		]
+		if not self.attn_modules:
+			raise ValueError("GMAR requires a model containing AttentionEncoder modules")
+
+	def _get_attention_matrices_and_grads(self, inputs: torch.Tensor, target_category: int = None):
+		self.model.eval()
+		self.model.zero_grad()
+
+		with torch.enable_grad():
+			logits = self.model(inputs)
+			if target_category is None:
+				target_category = logits.argmax(dim=-1).item()
+			logits[0, target_category].backward()
+
+		attentions = []
+		gradients = []
+		for module in self.attn_modules:
+			if module.attention is None or module.attention.grad is None:
+				raise RuntimeError("Attention weights or gradients were not captured")
+			attentions.append(module.attention.detach())
+			gradients.append(module.attention.grad.detach())
+
+		return attentions, gradients, target_category
+
+	def compute_head_weights(self, gradients: list[torch.Tensor], norm_type: str = "l1"):
+		layer_head_weights = []
+		for grad in gradients:
+			values = grad[0]
+			if norm_type == "l1":
+				norms = values.abs().sum(dim=(-2, -1))
+			elif norm_type == "l2":
+				norms = values.square().sum(dim=(-2, -1)).sqrt()
+			else:
+				raise ValueError("norm_type must be 'l1' or 'l2'")
+			layer_head_weights.append(norms / norms.sum().clamp_min(1e-8))
+		return layer_head_weights
+
+	def attention_rollout(self, attentions, head_weights, residual_ratio: float = 0.25):
+		batch_size, _, num_tokens, _ = attentions[0].shape
+		device = attentions[0].device
+		rollout = torch.eye(num_tokens, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+
+		for attention, weights in zip(attentions, head_weights):
+			weighted = (attention * weights.view(1, -1, 1, 1)).sum(dim=1)
+			identity = torch.eye(num_tokens, device=device).unsqueeze(0)
+			combined = weighted + residual_ratio * identity
+			combined = combined / combined.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+			rollout = combined @ rollout
+		return rollout
+
+	def generate_saliency_map(self, image_tensor: torch.Tensor, target_category: int = None,
+							  image_size: tuple = (32, 32)) -> torch.Tensor:
+		attentions, gradients, _ = self._get_attention_matrices_and_grads(
+			image_tensor, target_category
+		)
+		head_weights = self.compute_head_weights(gradients)
+		rollout = self.attention_rollout(attentions, head_weights)
+		cls_rollout = rollout[0, 0, 1:]
+		grid_size = int(cls_rollout.numel() ** 0.5)
+		if grid_size * grid_size != cls_rollout.numel():
+			raise ValueError("Number of patch tokens must form a square grid")
+		saliency_map = cls_rollout.reshape(1, 1, grid_size, grid_size)
+		saliency_map = F.interpolate(saliency_map, size=image_size, mode="bicubic", align_corners=False)
+		saliency_map = saliency_map.squeeze()
+		saliency_map = (saliency_map - saliency_map.min()) / (saliency_map.max() - saliency_map.min() + 1e-8)
+		self.model.zero_grad()
+		return saliency_map
 
 
 MILESTONE_PCTS = [15, 30, 45, 60, 75, 90]

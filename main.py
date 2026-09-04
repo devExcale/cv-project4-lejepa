@@ -20,7 +20,7 @@ from src.utils import (
 
 def parse_args():
 	parser = argparse.ArgumentParser(description="LeJEPA vs Supervised Interpretability Pipeline")
-	parser.add_argument("mode", choices=["train", "select_milestones", "eval", "pca", "gradcam", "test_cuda", "test_config", "test_pipeline"])
+	parser.add_argument("mode", choices=["train", "select_milestones", "eval", "pca", "gradcam", "GMAR", "test_cuda", "test_config", "test_pipeline"])
 	parser.add_argument("-d", "--dataset", choices=list(DATASETS.keys()))
 	parser.add_argument("-a", "--arch", choices=["cnn", "vit"])
 	parser.add_argument("-p", "--paradigm", choices=["std", "lejepa"])
@@ -178,7 +178,7 @@ def main():
 		)
 		return
 
-	if args.mode in ("eval", "gradcam"):
+	if args.mode in ("eval", "gradcam", "GMAR"):
 		checkpoint_path = _best_retained_checkpoint(summary)
 		checkpoint = torch.load(checkpoint_path, map_location=device)
 		model.load_state_dict(checkpoint["model_state_dict"])
@@ -204,6 +204,8 @@ def main():
 		if args.paradigm == "std":
 			print("Original supervised head test performance (separate from milestone-selection probe):")
 			evaluate_model(model, test_loader, device, verbose=True)
+		if args.mode == "GMAR":
+			evaluate_gmar(model, test_loader, device)
 		else:
 			evaluate_lejepa(model, test_loader, device)
 		return

@@ -20,7 +20,7 @@ class GuidedBackprop:
 	def __init__(self, model: nn.Module):
 		self.model = model
 		self.hooks = []
-		# In-place ReLUs break backward hooks; disable them across the entire model
+		# In-place ReLUs break backward hooks; disable them across the entire model.
 		for module in self.model.modules():
 			if isinstance(module, nn.ReLU):
 				module.inplace = False
@@ -34,21 +34,26 @@ class GuidedBackprop:
 			if isinstance(module, nn.ReLU):
 				self.hooks.append(module.register_full_backward_hook(relu_backward_hook))
 
-	def generate_gradients(self, input_tensor: torch.Tensor, target_class: int) -> np.ndarray:
+	def generate_gradients(
+		self,
+		input_tensor: torch.Tensor,
+		target_class: int | torch.Tensor | None = None,
+	) -> np.ndarray:
+		"""Return guided input gradients as [B, H, W, C]."""
 		self.model.eval()
-		self._register_hooks()  # Attach hooks only for Guided Backprop pass
-
-		input_tensor = input_tensor.clone().detach().requires_grad_(True)
-		output = self.model(input_tensor)
-		self.model.zero_grad()
-
-		score = output[0, target_class]
-		score.backward()
-
-		gradients = input_tensor.grad.detach().cpu().squeeze(0).permute(1, 2, 0).numpy()
-
-		self.remove_hooks()  # Detach hooks immediately so other passes run normally
-		return gradients
+		self._register_hooks()
+		try:
+			input_tensor = input_tensor.clone().detach().requires_grad_(True)
+			self.model.zero_grad()
+			output = self.model(input_tensor)
+			targets = _resolve_target_classes(output, target_class)
+			score = output.gather(1, targets.unsqueeze(1)).sum()
+			score.backward()
+			if input_tensor.grad is None:
+				raise RuntimeError("Input gradients were not captured")
+			return input_tensor.grad.detach().cpu().permute(0, 2, 3, 1).numpy()
+		finally:
+			self.remove_hooks()
 
 	def remove_hooks(self):
 		for hook in self.hooks:
@@ -56,34 +61,52 @@ class GuidedBackprop:
 		self.hooks = []
 
 
+def _resolve_target_classes(
+	logits: torch.Tensor,
+	target_class: int | torch.Tensor | None,
+) -> torch.Tensor:
+	batch_size = logits.size(0)
+	if target_class is None:
+		return logits.argmax(dim=1)
+	if isinstance(target_class, int):
+		return torch.full(
+			(batch_size,),
+			target_class,
+			device=logits.device,
+			dtype=torch.long,
+		)
+	targets = torch.as_tensor(target_class, device=logits.device, dtype=torch.long).flatten()
+	if targets.numel() != batch_size:
+		raise ValueError(
+			f"Expected one target class per sample ({batch_size}), got {targets.numel()}"
+		)
+	return targets
+
+
 class GradCAM:
-	"""
-	Grad-CAM hook manager and saliency map generator for CNN backbones.
-	"""
+	"""Grad-CAM hook manager and batched saliency map generator for CNN backbones."""
 
 	def __init__(self, model: nn.Module, target_layer: nn.Module):
 		self.model = model
 		self.target_layer: nn.Module = target_layer
 		self.activations: Optional[torch.Tensor] = None
 		self.gradients: Optional[torch.Tensor] = None
-
-		# Register forward and backward hooks
 		self.forward_handle = self.target_layer.register_forward_hook(self._forward_hook)
 		self.backward_handle = self.target_layer.register_full_backward_hook(self._backward_hook)
 
 	def _forward_hook(
-			self,
-			_module: nn.Module,
-			_inputs: Tuple[torch.Tensor, ...],
-			output: torch.Tensor,
+		self,
+		_module: nn.Module,
+		_inputs: Tuple[torch.Tensor, ...],
+		output: torch.Tensor,
 	) -> None:
 		self.activations = output.detach()
 
 	def _backward_hook(
-			self,
-			_module: nn.Module,
-			_grad_input: tuple[torch.Tensor | None, ...] | torch.Tensor,
-			grad_output: tuple[torch.Tensor | None, ...] | torch.Tensor,
+		self,
+		_module: nn.Module,
+		_grad_input: tuple[torch.Tensor | None, ...] | torch.Tensor,
+		grad_output: tuple[torch.Tensor | None, ...] | torch.Tensor,
 	) -> tuple[torch.Tensor | None, ...] | torch.Tensor | None:
 		if isinstance(grad_output, tuple) and grad_output:
 			self.gradients = grad_output[0].detach() if grad_output[0] is not None else None
@@ -92,53 +115,42 @@ class GradCAM:
 		return None
 
 	def generate_cam(
-			self,
-			input_tensor: torch.Tensor,
-			target_class: Optional[int] = None
+		self,
+		input_tensor: torch.Tensor,
+		target_class: int | torch.Tensor | None = None,
 	) -> torch.Tensor:
-		"""
-		Generate normalized Grad-CAM heatmaps for a single input tensor of shape [1, C, H, W].
-		Returns a 2D float tensor of shape [H, W] normalized in [0, 1].
-		"""
+		"""Generate one normalized Grad-CAM heatmap per input, shaped [B, H, W]."""
 		self.model.eval()
 		self.model.zero_grad()
+		logits = self.model(input_tensor)
+		targets = _resolve_target_classes(logits, target_class)
+		logits.gather(1, targets.unsqueeze(1)).sum().backward()
 
-		# Forward pass
-		logits = self.model(input_tensor)  # [1, Num_Classes]
+		if self.gradients is None or self.activations is None:
+			raise RuntimeError("Grad-CAM activations or gradients were not captured")
 
-		if target_class is None:
-			target_class = logits.argmax(dim=1).item()
+		weights = self.gradients.mean(dim=(2, 3), keepdim=True)
+		cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+		cam = F.relu(cam)
+		_, _, height, width = input_tensor.shape
+		cam = F.interpolate(cam, size=(height, width), mode="bilinear", align_corners=False)
+		cam = cam.squeeze(1)
 
-		# Target score (pre-softmax)
-		score = logits[0, target_class]
-		score.backward(retain_graph=True)
-
-		# Global average pooling of gradients: alpha_k = (1/Z) * sum(grad)
-		# self.gradients: [1, C, H', W'], self.activations: [1, C, H', W']
-		weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)  # [1, C, 1, 1]
-
-		# Weighted combination of feature activation maps
-		cam = torch.sum(weights * self.activations, dim=1, keepdim=True)  # [1, 1, H', W']
-		cam = F.relu(cam)  # Apply ReLU to focus on features that have a positive influence
-
-		# Upsample to original input resolution (32x32)
-		_, _, h, w = input_tensor.shape
-		cam = F.interpolate(cam, size=(h, w), mode="bilinear", align_corners=False)
-		cam = cam.squeeze().cpu()
-
-		# Normalize between 0 and 1
-		cam_min, cam_max = cam.min(), cam.max()
-		if cam_max > cam_min:
-			cam = (cam - cam_min) / (cam_max - cam_min)
-		else:
-			cam = torch.zeros_like(cam)
-
-		return cam
+		flat = cam.flatten(1)
+		cam_min = flat.min(dim=1).values.view(-1, 1, 1)
+		cam_max = flat.max(dim=1).values.view(-1, 1, 1)
+		denominator = cam_max - cam_min
+		cam = torch.where(
+			denominator > 0,
+			(cam - cam_min) / denominator.clamp_min(1e-8),
+			torch.zeros_like(cam),
+		)
+		return cam.detach().cpu()
 
 	def remove_hooks(self):
-		"""Clean up PyTorch hooks."""
 		self.forward_handle.remove()
 		self.backward_handle.remove()
+
 
 class GMAR:
 	def __init__(self, model: nn.Module):
@@ -150,15 +162,18 @@ class GMAR:
 		if not self.attn_modules:
 			raise ValueError("GMAR requires a model containing AttentionEncoder modules")
 
-	def _get_attention_matrices_and_grads(self, inputs: torch.Tensor, target_category: int = None):
+	def _get_attention_matrices_and_grads(
+		self,
+		inputs: torch.Tensor,
+		target_category: int | torch.Tensor | None = None,
+	):
 		self.model.eval()
 		self.model.zero_grad()
 
 		with torch.enable_grad():
 			logits = self.model(inputs, need_attn=True)
-			if target_category is None:
-				target_category = logits.argmax(dim=-1).item()
-			logits[0, target_category].backward()
+			targets = _resolve_target_classes(logits, target_category)
+			logits.gather(1, targets.unsqueeze(1)).sum().backward()
 
 		attentions = []
 		gradients = []
@@ -167,20 +182,22 @@ class GMAR:
 				raise RuntimeError("Attention weights or gradients were not captured")
 			attentions.append(module.attention.detach())
 			gradients.append(module.attention.grad.detach())
+			module.attention = None
 
-		return attentions, gradients, target_category
+		return attentions, gradients, targets
 
 	def compute_head_weights(self, gradients: list[torch.Tensor], norm_type: str = "l1"):
 		layer_head_weights = []
 		for grad in gradients:
-			values = grad[0]
 			if norm_type == "l1":
-				norms = values.abs().sum(dim=(-2, -1))
+				norms = grad.abs().sum(dim=(-2, -1))
 			elif norm_type == "l2":
-				norms = values.square().sum(dim=(-2, -1)).sqrt()
+				norms = grad.square().sum(dim=(-2, -1)).sqrt()
 			else:
 				raise ValueError("norm_type must be 'l1' or 'l2'")
-			layer_head_weights.append(norms / norms.sum().clamp_min(1e-8))
+			layer_head_weights.append(
+				norms / norms.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+			)
 		return layer_head_weights
 
 	def attention_rollout(self, attentions, head_weights, residual_ratio: float = 0.25):
@@ -189,30 +206,45 @@ class GMAR:
 		rollout = torch.eye(num_tokens, device=device).unsqueeze(0).expand(batch_size, -1, -1)
 
 		for attention, weights in zip(attentions, head_weights):
-			weighted = (attention * weights.view(1, -1, 1, 1)).sum(dim=1)
+			weighted = (attention * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
 			identity = torch.eye(num_tokens, device=device).unsqueeze(0)
 			combined = weighted + residual_ratio * identity
 			combined = combined / combined.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 			rollout = combined @ rollout
 		return rollout
 
-	def generate_saliency_map(self, image_tensor: torch.Tensor, target_category: int = None,
-							  image_size: tuple = (32, 32)) -> torch.Tensor:
+	def generate_saliency_map(
+		self,
+		image_tensor: torch.Tensor,
+		target_category: int | torch.Tensor | None = None,
+		image_size: tuple = (32, 32),
+	) -> torch.Tensor:
+		"""Return one normalized GMAR saliency map per input, shaped [B, H, W]."""
 		attentions, gradients, _ = self._get_attention_matrices_and_grads(
-			image_tensor, target_category
+			image_tensor,
+			target_category,
 		)
 		head_weights = self.compute_head_weights(gradients)
 		rollout = self.attention_rollout(attentions, head_weights)
-		cls_rollout = rollout[0, 0, 1:]
-		grid_size = int(cls_rollout.numel() ** 0.5)
-		if grid_size * grid_size != cls_rollout.numel():
+		cls_rollout = rollout[:, 0, 1:]
+		num_patches = cls_rollout.size(-1)
+		grid_size = int(num_patches ** 0.5)
+		if grid_size * grid_size != num_patches:
 			raise ValueError("Number of patch tokens must form a square grid")
-		saliency_map = cls_rollout.reshape(1, 1, grid_size, grid_size)
-		saliency_map = F.interpolate(saliency_map, size=image_size, mode="bicubic", align_corners=False)
-		saliency_map = saliency_map.squeeze()
-		saliency_map = (saliency_map - saliency_map.min()) / (saliency_map.max() - saliency_map.min() + 1e-8)
+
+		saliency_map = cls_rollout.reshape(-1, 1, grid_size, grid_size)
+		saliency_map = F.interpolate(
+			saliency_map,
+			size=image_size,
+			mode="bicubic",
+			align_corners=False,
+		).squeeze(1)
+		flat = saliency_map.flatten(1)
+		minimum = flat.min(dim=1).values.view(-1, 1, 1)
+		maximum = flat.max(dim=1).values.view(-1, 1, 1)
+		saliency_map = (saliency_map - minimum) / (maximum - minimum).clamp_min(1e-8)
 		self.model.zero_grad()
-		return saliency_map
+		return saliency_map.detach()
 
 
 MILESTONE_PCTS = [15, 30, 45, 60, 75, 90]
@@ -385,11 +417,153 @@ def select_and_prune_milestones(
 	return summary
 
 
-def denormalize(images: torch.Tensor, dataset_name: str) -> torch.Tensor:
-	mean, std = get_or_compute_stats(dataset_name)
+def denormalize(
+	images: torch.Tensor,
+	dataset_name: str,
+	val_fraction: float = CONFIG["val_fraction"],
+) -> torch.Tensor:
+	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
 	mean_tensor = torch.tensor(mean, dtype=images.dtype).view(1, -1, 1, 1)
 	std_tensor = torch.tensor(std, dtype=images.dtype).view(1, -1, 1, 1)
 	return (images.cpu() * std_tensor + mean_tensor).clamp(0, 1)
+
+
+def _run_pca_checkpoint(
+	checkpoint_path: str,
+	dataset: str,
+	arch: str,
+	paradigm: str,
+	test_loader,
+	device: torch.device,
+	num_samples: int,
+	val_fraction: float,
+	model_config: Dict,
+	output_name: str,
+):
+	from src.evaluation import pca_outputs
+
+	checkpoint = torch.load(checkpoint_path, map_location=device)
+	model = build_model(
+		arch,
+		dataset,
+		paradigm,
+		num_slices=model_config.get("num_slices", CONFIG["sigreg_slices"]),
+		t_max=model_config.get("t_max", CONFIG["sigreg_tmax"]),
+		n_points=model_config.get("n_points", CONFIG["sigreg_points"]),
+		lamb=model_config.get("lamb", CONFIG["lejepa_lambda"]),
+	).to(device)
+	model.load_state_dict(checkpoint["model_state_dict"])
+	model.eval()
+
+	epoch = int(checkpoint.get("epoch", -1))
+	milestone_labels = sorted(checkpoint.get("milestones", []))
+	output_root = os.path.join(
+		DIR_OUTPUT,
+		"pca",
+		dataset,
+		f"{arch}_{paradigm}",
+		output_name,
+	)
+
+	saved = 0
+	sample_index = 0
+	num_layers = None
+
+	with torch.no_grad():
+		for images, labels in test_loader:
+			remaining = num_samples - saved
+			if remaining <= 0:
+				break
+
+			images = images[:remaining]
+			labels = labels[:remaining]
+			features = model.forward_features(images.to(device, non_blocking=True))
+			originals = denormalize(images, dataset, val_fraction=val_fraction)
+			num_layers = len(features)
+
+			for batch_index in range(images.size(0)):
+				for layer_index, feature_map in enumerate(features):
+					result = pca_outputs(feature_map, image_index=batch_index)
+					result_dir = os.path.join(
+						output_root,
+						f"layer_{layer_index:02d}",
+						f"sample_{sample_index:05d}",
+					)
+					os.makedirs(result_dir, exist_ok=True)
+
+					metadata = {
+						"dataset": dataset,
+						"sample_index": sample_index,
+						"label": int(labels[batch_index]),
+						"architecture": arch,
+						"paradigm": paradigm,
+						"epoch": epoch,
+						"milestones": milestone_labels,
+						"layer_index": layer_index,
+						"pca_components": 3,
+						"checkpoint_path": checkpoint_path,
+					}
+
+					payload = {
+						"original": originals[batch_index],
+						"components": result["components"],
+						"mask": result["mask"],
+						"rgb": result["rgb"],
+						"metadata": metadata,
+					}
+
+					torch.save(payload, os.path.join(result_dir, "pca.pt"))
+					save_image(originals[batch_index], os.path.join(result_dir, "original.png"))
+					save_image(result["rgb"].permute(2, 0, 1), os.path.join(result_dir, "pca_rgb.png"))
+					save_image(result["mask"].float().unsqueeze(0), os.path.join(result_dir, "pca_mask.png"))
+					with open(os.path.join(result_dir, "metadata.json"), "w") as file:
+						json.dump(metadata, file, indent=2)
+
+				sample_index += 1
+				saved += 1
+
+	print(
+		f"[PCA] Epoch {epoch}: saved {saved} test samples "
+		f"across {num_layers} feature layers to '{output_root}'."
+	)
+
+
+def run_pca_for_checkpoint(
+	checkpoint_path: str,
+	dataset: str,
+	arch: str,
+	paradigm: str,
+	batch_size: int,
+	device: torch.device,
+	num_samples: int = 8,
+	val_fraction: float = CONFIG["val_fraction"],
+	model_config: Dict | None = None,
+):
+	"""Run PCA only on one explicitly chosen checkpoint (for example *_best.pt)."""
+	if num_samples < 1:
+		return
+
+	_, _, test_loader = get_dataloaders(
+		dataset,
+		batch_size=batch_size,
+		paradigm="std",
+		val_fraction=val_fraction,
+		include_test=True,
+	)
+	checkpoint = torch.load(checkpoint_path, map_location="cpu")
+	epoch = int(checkpoint.get("epoch", -1))
+	_run_pca_checkpoint(
+		checkpoint_path,
+		dataset,
+		arch,
+		paradigm,
+		test_loader,
+		device,
+		num_samples,
+		val_fraction,
+		model_config or {},
+		f"best_epoch_{epoch:04d}",
+	)
 
 
 def run_pca_for_milestones(
@@ -400,8 +574,6 @@ def run_pca_for_milestones(
 	val_fraction: float = CONFIG["val_fraction"],
 ):
 	"""Run the original SVD-based spatial PCA on a fixed test subset for every milestone checkpoint."""
-	from src.evaluation import pca_outputs
-
 	if num_samples < 1:
 		return
 
@@ -419,96 +591,25 @@ def run_pca_for_milestones(
 	)
 
 	milestone_epochs = sorted({info["epoch"] for info in summary["milestones"].values()})
-
 	for epoch in milestone_epochs:
 		path = next(
 			checkpoint_path
 			for checkpoint_path in summary["retained_checkpoints"]
 			if _epoch_from_checkpoint(checkpoint_path) == epoch
 		)
-
-		checkpoint = torch.load(path, map_location=device)
-		model = build_model(
-			arch,
-			dataset,
-			paradigm,
-			num_slices=model_config.get("num_slices", CONFIG["sigreg_slices"]),
-			t_max=model_config.get("t_max", CONFIG["sigreg_tmax"]),
-			n_points=model_config.get("n_points", CONFIG["sigreg_points"]),
-			lamb=model_config.get("lamb", CONFIG["lejepa_lambda"]),
-		).to(device)
-		model.load_state_dict(checkpoint["model_state_dict"])
-		model.eval()
-
+		checkpoint = torch.load(path, map_location="cpu")
 		milestone_labels = sorted(checkpoint.get("milestones", []))
-		output_root = os.path.join(
-			DIR_OUTPUT,
-			"pca",
+		_run_pca_checkpoint(
+			path,
 			dataset,
-			f"{arch}_{paradigm}",
+			arch,
+			paradigm,
+			test_loader,
+			device,
+			num_samples,
+			val_fraction,
+			model_config,
 			f"epoch_{epoch:04d}_milestones_{'-'.join(map(str, milestone_labels))}",
-		)
-
-		saved = 0
-		sample_index = 0
-		num_layers = None
-
-		with torch.no_grad():
-			for images, labels in test_loader:
-				remaining = num_samples - saved
-				if remaining <= 0:
-					break
-
-				images = images[:remaining]
-				labels = labels[:remaining]
-				features = model.forward_features(images.to(device, non_blocking=True))
-				originals = denormalize(images, dataset)
-				num_layers = len(features)
-
-				for batch_index in range(images.size(0)):
-					for layer_index, feature_map in enumerate(features):
-						result = pca_outputs(feature_map, image_index=batch_index)
-						result_dir = os.path.join(
-							output_root,
-							f"layer_{layer_index:02d}",
-							f"sample_{sample_index:05d}",
-						)
-						os.makedirs(result_dir, exist_ok=True)
-
-						metadata = {
-							"dataset": dataset,
-							"sample_index": sample_index,
-							"label": int(labels[batch_index]),
-							"architecture": arch,
-							"paradigm": paradigm,
-							"epoch": epoch,
-							"milestones": milestone_labels,
-							"layer_index": layer_index,
-							"pca_components": 3,
-							"checkpoint_path": path,
-						}
-
-						payload = {
-							"original": originals[batch_index],
-							"components": result["components"],
-							"mask": result["mask"],
-							"rgb": result["rgb"],
-							"metadata": metadata,
-						}
-
-						torch.save(payload, os.path.join(result_dir, "pca.pt"))
-						save_image(originals[batch_index], os.path.join(result_dir, "original.png"))
-						save_image(result["rgb"].permute(2, 0, 1), os.path.join(result_dir, "pca_rgb.png"))
-						save_image(result["mask"].float().unsqueeze(0), os.path.join(result_dir, "pca_mask.png"))
-						with open(os.path.join(result_dir, "metadata.json"), "w") as file:
-							json.dump(metadata, file, indent=2)
-
-					sample_index += 1
-					saved += 1
-
-		print(
-			f"[PCA] Epoch {epoch}: saved {saved} test samples "
-			f"across {num_layers} feature layers to '{output_root}'."
 		)
 
 

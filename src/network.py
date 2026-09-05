@@ -147,6 +147,7 @@ class AttentionEncoder(nn.Module):
 		)
 		self.norm1 = nn.LayerNorm(embed_dim)
 		self.norm2 = nn.LayerNorm(embed_dim)
+		self.attention: torch.Tensor | None = None
 
 	def self_attention(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
 		"""Esegue l'attenzione esplicita mantenendo i pesi per-head per GMAR."""
@@ -166,11 +167,13 @@ class AttentionEncoder(nn.Module):
 		attn_matrix = torch.matmul(query, key.transpose(-2, -1)) * scale
 		attn_weights = torch.softmax(attn_matrix, dim=-1)
 
-		# Salva il tensore per la backprop/GMAR prima del il dropout
-		if attn_weights.requires_grad:
-			attn_weights.retain_grad()
+		# Keep attention tensors only for interpretability passes that explicitly request them.
 		if need_attn:
+			if attn_weights.requires_grad:
+				attn_weights.retain_grad()
 			self.attention = attn_weights
+		else:
+			self.attention = None
 
 		# Applica dropout per il forward pass
 		attn_dropped = F.dropout(attn_weights, p=self.dropout, training=self.training)
@@ -313,6 +316,27 @@ class LeJEPA(nn.Module):
 		sigreg_loss = self.sigreg(projected.reshape(-1, projected.size(-1)))
 		loss = inv_loss + self.lamb * sigreg_loss
 		return loss, inv_loss, sigreg_loss
+
+
+class LinearProbeModel(nn.Module):
+	"""Classifier using a head that was trained as a frozen-backbone linear probe."""
+
+	def __init__(self, backbone: nn.Module, head: nn.Module):
+		super().__init__()
+		self.backbone = backbone
+		self.head = head
+		self.embed_dim = backbone.embed_dim
+
+	def forward_embedding(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
+		if need_attn:
+			return self.backbone.forward_embedding(x, need_attn=True)
+		return self.backbone.forward_embedding(x)
+
+	def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+		return self.backbone.forward_features(x)
+
+	def forward(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
+		return self.head(self.forward_embedding(x, need_attn=need_attn))
 
 
 def build_model(

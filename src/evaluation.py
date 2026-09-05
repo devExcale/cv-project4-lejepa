@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data import get_or_compute_stats
-from src.globals import DATASETS, DIR_DATA, DIR_OUTPUT
+from src.globals import CONFIG, DATASETS, DIR_DATA, DIR_OUTPUT
 from src.utils import GradCAM, GuidedBackprop, GMAR
 
 
@@ -98,6 +98,27 @@ def get_class_name(dataset_name: str, class_idx: int) -> str:
 	return f"Class {class_idx}"
 
 
+def _collect_samples(loader: DataLoader, num_samples: int) -> tuple[torch.Tensor, torch.Tensor]:
+	if num_samples < 1:
+		raise ValueError("num_samples must be >= 1")
+
+	image_parts = []
+	label_parts = []
+	collected = 0
+	for images, labels in loader:
+		remaining = num_samples - collected
+		if remaining <= 0:
+			break
+		take = min(remaining, images.size(0))
+		image_parts.append(images[:take])
+		label_parts.append(labels[:take])
+		collected += take
+
+	if not image_parts:
+		raise ValueError("The provided loader is empty")
+	return torch.cat(image_parts, dim=0), torch.cat(label_parts, dim=0)
+
+
 def run_gradcam_pipeline(
 		model: nn.Module,
 		val_loader: DataLoader,
@@ -105,75 +126,69 @@ def run_gradcam_pipeline(
 		arch: str,
 		paradigm: str,
 		device: torch.device,
-		num_samples: int = 8
+		num_samples: int = 8,
+		val_fraction: float = CONFIG["val_fraction"],
 ) -> str:
-	"""
-	Extract GMAR maps for validation samples.
-	"""
-	model.eval()
-	model.to(device)
-	fig, axes = plt.subplots(num_samples, 3, figsize=(9, 3 * num_samples))
-	target_layer = cast(nn.Module, list(getattr(model, "layer4").children())[-1])
+	"""Extract batched Grad-CAM and Guided Grad-CAM maps for test samples."""
+	model.eval().to(device)
+	backbone = getattr(model, "backbone", model)
+	if not hasattr(backbone, "layer4"):
+		raise ValueError("Grad-CAM requires a CNN backbone with a layer4 stage")
+
+	target_layer = cast(nn.Module, list(backbone.layer4.children())[-1])
 	grad_cam = GradCAM(model=model, target_layer=target_layer)
 	guided_bp = GuidedBackprop(model=model)
 
-	mean, std = get_or_compute_stats(dataset_name)
-	mean = np.array(mean).reshape(3, 1, 1)
-	std = np.array(std).reshape(3, 1, 1)
+	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
+	mean_array = np.array(mean).reshape(1, 3, 1, 1)
+	std_array = np.array(std).reshape(1, 3, 1, 1)
 
-	images_batch, labels_batch = next(iter(val_loader))
-	num_samples = min(num_samples, len(images_batch))
+	images_batch, labels_batch = _collect_samples(val_loader, num_samples)
+	inputs = images_batch.to(device)
+	targets = labels_batch.to(device)
 
+	try:
+		cam_maps = grad_cam.generate_cam(inputs, target_class=targets).numpy()
+		guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
+	finally:
+		grad_cam.remove_hooks()
+
+	originals = inputs.detach().cpu().numpy() * std_array + mean_array
+	originals = np.clip(originals.transpose(0, 2, 3, 1), 0.0, 1.0)
+
+	num_samples = inputs.size(0)
 	fig, axes = plt.subplots(num_samples, 3, figsize=(9, 3 * num_samples))
 	if num_samples == 1:
 		axes = np.expand_dims(axes, 0)
 
 	for i in range(num_samples):
-		img_tensor = images_batch[i:i + 1].to(device)
-		true_label = labels_batch[i].item()
+		true_label = int(labels_batch[i])
 		true_label_name = get_class_name(dataset_name, true_label)
-
-		# 1. Compute standard Grad-CAM
-		cam_map = grad_cam.generate_cam(img_tensor, target_class=true_label).numpy()
-
-		# 2. Compute Guided Backprop gradients
-		guided_grads = guided_bp.generate_gradients(img_tensor, target_class=true_label)
-
-		# 3. Denormalize input image
-		orig_img = img_tensor.squeeze(0).cpu().numpy()
-		orig_img = orig_img * std + mean
-		orig_img = np.clip(orig_img.transpose(1, 2, 0), 0.0, 1.0)
-
-		# 4. Fuse into Guided Grad-CAM
-		guided_cam = guided_grads * cam_map[..., np.newaxis]
+		guided_cam = guided_grads[i] * cam_maps[i][..., np.newaxis]
 		guided_cam -= guided_cam.mean()
-		guided_cam /= (guided_cam.std() + 1e-8)
-		guided_cam = guided_cam * 0.15 + 0.5
-		guided_cam = np.clip(guided_cam, 0.0, 1.0)
+		guided_cam /= guided_cam.std() + 1e-8
+		guided_cam = np.clip(guided_cam * 0.15 + 0.5, 0.0, 1.0)
 
-		# Plot 1: Input Image
-		axes[i, 0].imshow(orig_img)
+		axes[i, 0].imshow(originals[i])
 		axes[i, 0].set_title(f"Sample {i + 1} ({true_label_name})", fontsize=10)
 		axes[i, 0].axis("off")
 
-		# Plot 2: Grad-CAM Heatmap
-		axes[i, 1].imshow(cam_map, cmap="jet")
+		axes[i, 1].imshow(cam_maps[i], cmap="jet")
 		axes[i, 1].set_title("Grad-CAM Heatmap", fontsize=10)
 		axes[i, 1].axis("off")
 
-		# Plot 3: Guided Grad-CAM
 		axes[i, 2].imshow(guided_cam)
 		axes[i, 2].set_title("Guided Grad-CAM", fontsize=10)
 		axes[i, 2].axis("off")
 
 	plt.tight_layout()
 	output_filepath = os.path.join(DIR_OUTPUT, f"gradcam_{dataset_name}_{arch}_{paradigm}.png")
-	plt.savefig(output_filepath, dpi=300, bbox_inches="tight")
-	plt.close()
+	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
+	plt.close(fig)
 
-	grad_cam.remove_hooks()
 	print(f"[Grad-CAM Complete] Visualizations saved to: {output_filepath}")
 	return output_filepath
+
 
 def run_GMAR_pipeline(
 		model: nn.Module,
@@ -182,62 +197,50 @@ def run_GMAR_pipeline(
 		arch: str,
 		paradigm: str,
 		device: torch.device,
-		num_samples: int = 8
+		num_samples: int = 8,
+		val_fraction: float = CONFIG["val_fraction"],
 ) -> str:
-	"""
-	Extract Grad-CAM and Guided Grad-CAM maps for validation samples.
-	"""
-	model.eval()
-	model.to(device)
-
+	"""Extract batched GMAR maps for test samples."""
+	model.eval().to(device)
 	gmar = GMAR(model=model)
-	#guided_bp = GuidedBackprop(model=model)
 
-	mean, std = get_or_compute_stats(dataset_name)
-	mean = np.array(mean).reshape(3, 1, 1)
-	std = np.array(std).reshape(3, 1, 1)
+	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
+	mean_array = np.array(mean).reshape(1, 3, 1, 1)
+	std_array = np.array(std).reshape(1, 3, 1, 1)
 
-	images_batch, labels_batch = next(iter(val_loader))
-	num_samples = min(num_samples, len(images_batch))
+	images_batch, labels_batch = _collect_samples(val_loader, num_samples)
+	inputs = images_batch.to(device)
+	targets = labels_batch.to(device)
+	gmar_maps = gmar.generate_saliency_map(
+		inputs,
+		target_category=targets,
+		image_size=inputs.shape[-2:],
+	).cpu().numpy()
 
-	fig, axes = plt.subplots(num_samples, 3, figsize=(9, 3 * num_samples))
+	originals = inputs.detach().cpu().numpy() * std_array + mean_array
+	originals = np.clip(originals.transpose(0, 2, 3, 1), 0.0, 1.0)
+
+	num_samples = inputs.size(0)
+	fig, axes = plt.subplots(num_samples, 2, figsize=(6, 3 * num_samples))
 	if num_samples == 1:
 		axes = np.expand_dims(axes, 0)
 
 	for i in range(num_samples):
-		img_tensor = images_batch[i:i + 1].to(device)
-		true_label = labels_batch[i].item()
+		true_label = int(labels_batch[i])
 		true_label_name = get_class_name(dataset_name, true_label)
 
-		# 1. Compute GMAR saliency map
-		gmar_map = gmar.generate_saliency_map(
-			img_tensor,
-			target_category=true_label,
-			image_size=img_tensor.shape[-2:],
-		).detach().cpu().numpy()
-		print(gmar_map.shape, gmar_map.size)
-		# 2. Compute Guided Backprop gradients
-		#guided_grads = guided_bp.generate_gradients(img_tensor, target_class=true_label)
-
-		# 3. Denormalize input image
-		orig_img = img_tensor.squeeze(0).cpu().numpy()
-		orig_img = orig_img * std + mean
-		orig_img = np.clip(orig_img.transpose(1, 2, 0), 0.0, 1.0)
-
-		# Plot 1: Input Image
-		axes[i, 0].imshow(orig_img)
+		axes[i, 0].imshow(originals[i])
 		axes[i, 0].set_title(f"Sample {i + 1} ({true_label_name})", fontsize=10)
 		axes[i, 0].axis("off")
 
-		# Plot 2: GMAR saliency map
-		axes[i, 1].imshow(gmar_map[0], cmap="jet")
+		axes[i, 1].imshow(gmar_maps[i], cmap="jet")
 		axes[i, 1].set_title("GMAR Saliency", fontsize=10)
 		axes[i, 1].axis("off")
 
 	plt.tight_layout()
 	output_filepath = os.path.join(DIR_OUTPUT, f"gmar_{dataset_name}_{arch}_{paradigm}.png")
-	plt.savefig(output_filepath, dpi=300, bbox_inches="tight")
-	plt.close()
+	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
+	plt.close(fig)
 
 	print(f"[GMAR Complete] Visualizations saved to: {output_filepath}")
 	return output_filepath
@@ -378,16 +381,3 @@ def linear_probe(
         "history": history,
         "head_state_dict": {k: v.cpu() for k, v in best_head_state.items()},
     }
-
-def evaluate_lejepa(model: nn.Module, val_loader: DataLoader, device: torch.device) -> Tuple[float, float]:
-	model.eval().to(device)
-	means, stds = [], []
-	with torch.no_grad():
-		for images, _ in val_loader:
-			z = model(images=images.to(device))
-			means.append(z.mean().item())
-			stds.append(z.std().item())
-	print(f"Embedding mean: {sum(means) / len(means):.4f}")
-	print(f"Embedding std:  {sum(stds) / len(stds):.4f}")
-	return sum(means) / len(means), sum(stds) / len(stds)
-

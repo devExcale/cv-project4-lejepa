@@ -10,35 +10,34 @@ from src.globals import DATASETS, CONFIG
 
 class CIFARResNet18(ResNet):
 
-	def __init__(self, num_classes: int = 100):
-		super(CIFARResNet18, self).__init__(
-			block=BasicBlock,
-			layers=[2, 2, 2, 2],
-			num_classes=num_classes
-		)
-		self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-		self.bn1 = nn.BatchNorm2d(64)
-		self.maxpool = nn.Identity()
-		self.embed_dim = 512
+    def __init__(self, num_classes: int = 100):
+        super(CIFARResNet18, self).__init__(
+            block=BasicBlock,
+            layers=[2, 2, 2, 2],
+            num_classes=num_classes,
+        )
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.maxpool = nn.Identity()
+        self.embed_dim = 512
 
-	def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-		x = self.relu(self.bn1(self.conv1(x)))
-		x = self.maxpool(x)
+    def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
 
-		stage1 = self.layer1(x)          # [B, 64, H, W]
-		stage2 = self.layer2(stage1)     # [B, 128, H/2, W/2]
-		stage3 = self.layer3(stage2)     # [B, 256, H/4, W/4]
-		stage4 = self.layer4(stage3)     # [B, 512, H/8, W/8]
+        stage1 = self.layer1(x)          # [B, 64, H, W]
+        stage2 = self.layer2(stage1)     # [B, 128, H/2, W/2]
+        stage3 = self.layer3(stage2)     # [B, 256, H/4, W/4]
+        stage4 = self.layer4(stage3)     # [B, 512, H/8, W/8]
 
-		return stage1, stage2, stage3, stage4
+        return stage1, stage2, stage3, stage4
 
-	def forward_embedding(self, x: torch.Tensor) -> torch.Tensor:
-		*_, stage4 = self.forward_features(x)
-		return torch.flatten(self.avgpool(stage4), 1)
+    def forward_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        *_, stage4 = self.forward_features(x)
+        return torch.flatten(self.avgpool(stage4), 1)
 
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		return self.fc(self.forward_embedding(x))
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.forward_embedding(x))
 
 class VisionTransformer(nn.Module):
     '''
@@ -118,14 +117,14 @@ class VisionTransformer(nn.Module):
             features.append(spatial)
         return tuple(features)
 
-    def forward_embedding(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_embedding(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
         tokens, _, _, _ = self._prepare_tokens(x)
         for block in self.encoder:
-            tokens = block(tokens)
+            tokens = block(tokens, need_attn=need_attn)
         return self.norm(tokens[:, 0, :])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.forward_embedding(x))
+    def forward(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
+        return self.head(self.forward_embedding(x, need_attn=need_attn))
 
 class AttentionEncoder(nn.Module):
 	def __init__(self, embed_dim: int, num_heads: int = 8, mlp_ratio: float = 4.0, dropout: float = 0.0):
@@ -149,7 +148,7 @@ class AttentionEncoder(nn.Module):
 		self.norm1 = nn.LayerNorm(embed_dim)
 		self.norm2 = nn.LayerNorm(embed_dim)
 
-	def self_attention(self, x: torch.Tensor) -> torch.Tensor:
+	def self_attention(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
 		"""Esegue l'attenzione esplicita mantenendo i pesi per-head per GMAR."""
 		batch_size, num_tokens, _ = x.shape
 		head_dim = self.embed_dim // self.num_heads
@@ -170,7 +169,8 @@ class AttentionEncoder(nn.Module):
 		# Salva il tensore per la backprop/GMAR prima del il dropout
 		if attn_weights.requires_grad:
 			attn_weights.retain_grad()
-		self.attention = attn_weights
+		if need_attn:
+			self.attention = attn_weights
 
 		# Applica dropout per il forward pass
 		attn_dropped = F.dropout(attn_weights, p=self.dropout, training=self.training)
@@ -180,11 +180,10 @@ class AttentionEncoder(nn.Module):
 		
 		return self.out_proj(output)
 
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		x = x + self.self_attention(self.norm1(x))
-		x = x + self.mlp(self.norm2(x))
+	def forward(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
+		x = x + self.self_attention(self.norm1(x), need_attn=need_attn)
+		x = x + self.mlp(x)
 		return x
-
 
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, output_dim, dropout = 0.0):

@@ -155,7 +155,7 @@ class GMAR:
 		self.model.zero_grad()
 
 		with torch.enable_grad():
-			logits = self.model(inputs)
+			logits = self.model(inputs, need_attn=True)
 			if target_category is None:
 				target_category = logits.argmax(dim=-1).item()
 			logits[0, target_category].backward()

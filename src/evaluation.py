@@ -112,7 +112,7 @@ def run_gradcam_pipeline(
 	"""
 	model.eval()
 	model.to(device)
-
+	fig, axes = plt.subplots(num_samples, 3, figsize=(9, 3 * num_samples))
 	target_layer = cast(nn.Module, list(getattr(model, "layer4").children())[-1])
 	grad_cam = GradCAM(model=model, target_layer=target_layer)
 	guided_bp = GuidedBackprop(model=model)
@@ -124,7 +124,7 @@ def run_gradcam_pipeline(
 	images_batch, labels_batch = next(iter(val_loader))
 	num_samples = min(num_samples, len(images_batch))
 
-	fig, axes = plt.subplots(num_samples, 2, figsize=(6, 3 * num_samples))
+	fig, axes = plt.subplots(num_samples, 3, figsize=(9, 3 * num_samples))
 	if num_samples == 1:
 		axes = np.expand_dims(axes, 0)
 
@@ -190,7 +190,7 @@ def run_GMAR_pipeline(
 	model.eval()
 	model.to(device)
 
-	grad_cam = GMAR(model=model)
+	gmar = GMAR(model=model)
 	#guided_bp = GuidedBackprop(model=model)
 
 	mean, std = get_or_compute_stats(dataset_name)
@@ -210,12 +210,12 @@ def run_GMAR_pipeline(
 		true_label_name = get_class_name(dataset_name, true_label)
 
 		# 1. Compute GMAR saliency map
-		cam_map = grad_cam.generate_saliency_map(
+		gmar_map = gmar.generate_saliency_map(
 			img_tensor,
 			target_category=true_label,
 			image_size=img_tensor.shape[-2:],
-		).numpy()
-		print(cam_map.shape, cam_map.size)
+		).detach().cpu().numpy()
+		print(gmar_map.shape, gmar_map.size)
 		# 2. Compute Guided Backprop gradients
 		#guided_grads = guided_bp.generate_gradients(img_tensor, target_class=true_label)
 
@@ -224,20 +224,13 @@ def run_GMAR_pipeline(
 		orig_img = orig_img * std + mean
 		orig_img = np.clip(orig_img.transpose(1, 2, 0), 0.0, 1.0)
 
-		# 4. Fuse into Guided Grad-CAM
-		'''guided_cam = guided_grads * cam_map[..., np.newaxis]
-		guided_cam -= guided_cam.mean()
-		guided_cam /= (guided_cam.std() + 1e-8)
-		guided_cam = guided_cam * 0.15 + 0.5
-		guided_cam = np.clip(guided_cam, 0.0, 1.0) '''
-
 		# Plot 1: Input Image
 		axes[i, 0].imshow(orig_img)
 		axes[i, 0].set_title(f"Sample {i + 1} ({true_label_name})", fontsize=10)
 		axes[i, 0].axis("off")
 
 		# Plot 2: GMAR saliency map
-		axes[i, 1].imshow(cam_map, cmap="jet")
+		axes[i, 1].imshow(gmar_map[0], cmap="jet")
 		axes[i, 1].set_title("GMAR Saliency", fontsize=10)
 		axes[i, 1].axis("off")
 
@@ -397,3 +390,4 @@ def evaluate_lejepa(model: nn.Module, val_loader: DataLoader, device: torch.devi
 	print(f"Embedding mean: {sum(means) / len(means):.4f}")
 	print(f"Embedding std:  {sum(stds) / len(stds):.4f}")
 	return sum(means) / len(means), sum(stds) / len(stds)
+

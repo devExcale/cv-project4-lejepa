@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from src.data import get_dataloaders, get_or_compute_stats
-from src.evaluation import linear_probe, pca_outputs
 from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, DIR_OUTPUT, set_seed
 from src.network import AttentionEncoder, build_model
 
@@ -247,6 +246,8 @@ def select_and_prune_milestones(
 	lamb: float = CONFIG["lejepa_lambda"],
 ) -> Dict:
 	"""Load all periodic checkpoints, probe them, select relative milestones, and prune the rest."""
+	from src.evaluation import linear_probe
+
 	paths = list_periodic_checkpoints(dataset, arch, paradigm)
 	if not paths:
 		raise FileNotFoundError(
@@ -399,6 +400,8 @@ def run_pca_for_milestones(
 	val_fraction: float = CONFIG["val_fraction"],
 ):
 	"""Run the original SVD-based spatial PCA on a fixed test subset for every milestone checkpoint."""
+	from src.evaluation import pca_outputs
+
 	if num_samples < 1:
 		return
 

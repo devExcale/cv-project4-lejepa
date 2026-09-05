@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from src.evaluation import evaluate_model
 from src.globals import CONFIG, DIR_CHECKPOINTS
-from src.utils import get_checkpoint_path, MilestoneCheckpointer
+
 
 
 def get_lr_for_epoch(epoch: int, epochs: int, base_lr: float, warmup_epochs: int = 5) -> float:

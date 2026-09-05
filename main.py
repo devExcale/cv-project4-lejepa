@@ -5,12 +5,13 @@ import os
 import torch
 
 from src.data import get_dataloaders
-from src.evaluation import evaluate_lejepa, evaluate_model, run_gradcam_pipeline
+from src.evaluation import evaluate_lejepa, evaluate_model, run_GMAR_pipeline, run_gradcam_pipeline
 from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, set_seed
 from src.network import build_model
 from src.train import train_lejepa, train_supervised
 from src.utils import (
 	run_pca_for_milestones,
+	
 	select_and_prune_milestones,
 	test_config,
 	test_cuda,
@@ -205,7 +206,7 @@ def main():
 			print("Original supervised head test performance (separate from milestone-selection probe):")
 			evaluate_model(model, test_loader, device, verbose=True)
 		if args.mode == "GMAR":
-			evaluate_gmar(model, test_loader, device)
+			run_GMAR_pipeline(model, test_loader, args.dataset, args.arch, args.paradigm, device)
 		else:
 			evaluate_lejepa(model, test_loader, device)
 		return

@@ -108,7 +108,7 @@ def run_gradcam_pipeline(
 		num_samples: int = 8
 ) -> str:
 	"""
-	Extract Grad-CAM and Guided Grad-CAM maps for validation samples.
+	Extract GMAR maps for validation samples.
 	"""
 	model.eval()
 	model.to(device)
@@ -124,7 +124,7 @@ def run_gradcam_pipeline(
 	images_batch, labels_batch = next(iter(val_loader))
 	num_samples = min(num_samples, len(images_batch))
 
-	fig, axes = plt.subplots(num_samples, 3, figsize=(9, 3 * num_samples))
+	fig, axes = plt.subplots(num_samples, 2, figsize=(6, 3 * num_samples))
 	if num_samples == 1:
 		axes = np.expand_dims(axes, 0)
 
@@ -209,11 +209,15 @@ def run_GMAR_pipeline(
 		true_label = labels_batch[i].item()
 		true_label_name = get_class_name(dataset_name, true_label)
 
-		# 1. Compute standard Grad-CAM
-		cam_map = grad_cam.generate_cam(img_tensor, target_class=true_label).numpy()
-
+		# 1. Compute GMAR saliency map
+		cam_map = grad_cam.generate_saliency_map(
+			img_tensor,
+			target_category=true_label,
+			image_size=img_tensor.shape[-2:],
+		).numpy()
+		print(cam_map.shape, cam_map.size)
 		# 2. Compute Guided Backprop gradients
-		guided_grads = guided_bp.generate_gradients(img_tensor, target_class=true_label)
+		#guided_grads = guided_bp.generate_gradients(img_tensor, target_class=true_label)
 
 		# 3. Denormalize input image
 		orig_img = img_tensor.squeeze(0).cpu().numpy()
@@ -221,34 +225,28 @@ def run_GMAR_pipeline(
 		orig_img = np.clip(orig_img.transpose(1, 2, 0), 0.0, 1.0)
 
 		# 4. Fuse into Guided Grad-CAM
-		guided_cam = guided_grads * cam_map[..., np.newaxis]
+		'''guided_cam = guided_grads * cam_map[..., np.newaxis]
 		guided_cam -= guided_cam.mean()
 		guided_cam /= (guided_cam.std() + 1e-8)
 		guided_cam = guided_cam * 0.15 + 0.5
-		guided_cam = np.clip(guided_cam, 0.0, 1.0)
+		guided_cam = np.clip(guided_cam, 0.0, 1.0) '''
 
 		# Plot 1: Input Image
 		axes[i, 0].imshow(orig_img)
 		axes[i, 0].set_title(f"Sample {i + 1} ({true_label_name})", fontsize=10)
 		axes[i, 0].axis("off")
 
-		# Plot 2: Grad-CAM Heatmap
+		# Plot 2: GMAR saliency map
 		axes[i, 1].imshow(cam_map, cmap="jet")
-		axes[i, 1].set_title("Grad-CAM Heatmap", fontsize=10)
+		axes[i, 1].set_title("GMAR Saliency", fontsize=10)
 		axes[i, 1].axis("off")
 
-		# Plot 3: Guided Grad-CAM
-		axes[i, 2].imshow(guided_cam)
-		axes[i, 2].set_title("Guided Grad-CAM", fontsize=10)
-		axes[i, 2].axis("off")
-
 	plt.tight_layout()
-	output_filepath = os.path.join(DIR_OUTPUT, f"gradcam_{dataset_name}_{arch}_{paradigm}.png")
+	output_filepath = os.path.join(DIR_OUTPUT, f"gmar_{dataset_name}_{arch}_{paradigm}.png")
 	plt.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close()
 
-	grad_cam.remove_hooks()
-	print(f"[Grad-CAM Complete] Visualizations saved to: {output_filepath}")
+	print(f"[GMAR Complete] Visualizations saved to: {output_filepath}")
 	return output_filepath
 
 def evaluate_model(
@@ -388,3 +386,14 @@ def linear_probe(
         "head_state_dict": {k: v.cpu() for k, v in best_head_state.items()},
     }
 
+def evaluate_lejepa(model: nn.Module, val_loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+	model.eval().to(device)
+	means, stds = [], []
+	with torch.no_grad():
+		for images, _ in val_loader:
+			z = model(images=images.to(device))
+			means.append(z.mean().item())
+			stds.append(z.std().item())
+	print(f"Embedding mean: {sum(means) / len(means):.4f}")
+	print(f"Embedding std:  {sum(stds) / len(stds):.4f}")
+	return sum(means) / len(means), sum(stds) / len(stds)

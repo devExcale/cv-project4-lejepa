@@ -292,92 +292,103 @@ If accuracies for self-supervised and supervised models are similar, it indicate
 '''
 
 def evaluate_linear_head(backbone, head, loader, device):
-    backbone.eval()
-    head.eval()
-    criterion = nn.CrossEntropyLoss()
-    running_loss = 0.0
-    correct = total = 0
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            logits = head(backbone.forward_embedding(images))
-            running_loss += criterion(logits, labels).item() * labels.size(0)
-            correct += logits.argmax(dim=1).eq(labels).sum().item()
-            total += labels.size(0)
-    return running_loss / total, 100.0 * correct / total
+	backbone.eval()
+	head.eval()
+	criterion = nn.CrossEntropyLoss()
+	running_loss = 0.0
+	correct = total = 0
+	with torch.no_grad():
+		for images, labels in loader:
+			images = images.to(device, non_blocking=True)
+			labels = labels.to(device, non_blocking=True)
+			logits = head(backbone.forward_embedding(images))
+			running_loss += criterion(logits, labels).item() * labels.size(0)
+			correct += logits.argmax(dim=1).eq(labels).sum().item()
+			total += labels.size(0)
+	return running_loss / total, 100.0 * correct / total
 
 
 def linear_probe(
-    backbone,
-    train_loader,
-    val_loader,
-    test_loader,
-    num_classes,
-    device,
-    epochs=50,
-    lr=0.1,
-    weight_decay=0.0,
+	backbone,
+	train_loader,
+	val_loader,
+	test_loader,
+	num_classes,
+	device,
+	epochs=50,
+	lr=0.1,
+	weight_decay=0.0,
 ):
-    """Train an identical frozen-backbone linear probe for std and LeJEPA."""
-    from copy import deepcopy
-    import torch.optim as optim
+	"""Train an identical frozen-backbone linear probe for std and LeJEPA."""
+	from copy import deepcopy
+	import torch.optim as optim
 
-    backbone = backbone.to(device)
-    backbone.eval()
-    for parameter in backbone.parameters():
-        parameter.requires_grad_(False)
+	backbone = backbone.to(device)
+	backbone.eval()
+	for parameter in backbone.parameters():
+		parameter.requires_grad_(False)
 
-    head = nn.Linear(backbone.embed_dim, num_classes).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(head.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+	head = nn.Linear(backbone.embed_dim, num_classes).to(device)
+	criterion = nn.CrossEntropyLoss()
+	optimizer = optim.SGD(head.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+	scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    best_val_acc = float("-inf")
-    best_head_state = None
-    best_epoch = 0
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+	best_val_acc = float("-inf")
+	best_head_state = None
+	best_epoch = 0
+	history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
-    for epoch in range(1, epochs + 1):
-        head.train()
-        running_loss = 0.0
-        correct = total = 0
-        for images, labels in tqdm(train_loader, desc=f"Linear probe {epoch:03d}/{epochs:03d}", leave=False):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            with torch.no_grad():
-                embeddings = backbone.forward_embedding(images)
-            optimizer.zero_grad()
-            logits = head(embeddings)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item() * labels.size(0)
-            correct += logits.argmax(dim=1).eq(labels).sum().item()
-            total += labels.size(0)
+	for epoch in range(1, epochs + 1):
+		head.train()
+		running_loss = 0.0
+		correct = total = 0
+		for images, labels in tqdm(train_loader, desc=f"Linear probe {epoch:03d}/{epochs:03d}", leave=False):
+			images = images.to(device, non_blocking=True)
+			labels = labels.to(device, non_blocking=True)
+			with torch.no_grad():
+				embeddings = backbone.forward_embedding(images)
+			optimizer.zero_grad()
+			logits = head(embeddings)
+			loss = criterion(logits, labels)
+			loss.backward()
+			optimizer.step()
+			running_loss += loss.item() * labels.size(0)
+			correct += logits.argmax(dim=1).eq(labels).sum().item()
+			total += labels.size(0)
 
-        train_loss = running_loss / total
-        train_acc = 100.0 * correct / total
-        val_loss, val_acc = evaluate_linear_head(backbone, head, val_loader, device)
-        scheduler.step()
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_epoch = epoch
-            best_head_state = deepcopy(head.state_dict())
+		train_loss = running_loss / total
+		train_acc = 100.0 * correct / total
+		val_loss, val_acc = evaluate_linear_head(backbone, head, val_loader, device)
+		scheduler.step()
+		history["train_loss"].append(train_loss)
+		history["train_acc"].append(train_acc)
+		history["val_loss"].append(val_loss)
+		history["val_acc"].append(val_acc)
 
-    head.load_state_dict(best_head_state)
-    test_loss, test_acc = evaluate_linear_head(backbone, head, test_loader, device)
-    for parameter in backbone.parameters():
-        parameter.requires_grad_(True)
-    return {
-        "best_epoch": best_epoch,
-        "best_val_acc": best_val_acc,
-        "test_loss": test_loss,
-        "test_acc": test_acc,
-        "history": history,
-        "head_state_dict": {k: v.cpu() for k, v in best_head_state.items()},
-    }
+		print(
+			f"Linear probe {epoch:03d}/{epochs:03d} | "
+			f"Train Loss {train_loss:.4f} | Train Acc {train_acc:.2f}% | "
+			f"Val Loss {val_loss:.4f} | Val Acc {val_acc:.2f}%"
+		)
+
+		if val_acc > best_val_acc:
+			best_val_acc = val_acc
+			best_epoch = epoch
+			best_head_state = deepcopy(head.state_dict())
+
+	head.load_state_dict(best_head_state)
+	test_loss, test_acc = evaluate_linear_head(backbone, head, test_loader, device)
+	print(
+		f"[Linear Probe Complete] Best epoch {best_epoch:03d} | "
+		f"Best Val Acc {best_val_acc:.2f}% | Test Acc {test_acc:.2f}%"
+	)
+	for parameter in backbone.parameters():
+		parameter.requires_grad_(True)
+	return {
+		"best_epoch": best_epoch,
+		"best_val_acc": best_val_acc,
+		"test_loss": test_loss,
+		"test_acc": test_acc,
+		"history": history,
+		"head_state_dict": {k: v.cpu() for k, v in best_head_state.items()},
+	}

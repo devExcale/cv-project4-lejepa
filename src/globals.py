@@ -47,7 +47,7 @@ CONFIG = {
 	"epochs": 100,
 	"momentum": 0.9,
 	"val_fraction": 0.1,
-    "checkpoint_interval": 5,
+    "checkpoint_interval": 10,
 	"probe_epochs": 50,
 	"probe_lr": 0.1,
 	"pca_samples": 8,

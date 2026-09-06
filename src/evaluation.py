@@ -202,6 +202,7 @@ def run_GMAR_pipeline(
 ) -> str:
 	"""Extract batched GMAR maps for test samples."""
 	model.eval().to(device)
+	backbone = getattr(model, "backbone", model)
 	gmar = GMAR(model=model)
 
 	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)

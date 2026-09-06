@@ -171,7 +171,14 @@ class GMAR:
 		self.model.zero_grad()
 
 		with torch.enable_grad():
-			logits = self.model(inputs, need_attn=True)
+			try:
+				logits = self.model(inputs, need_attn=True)
+			except TypeError as exc:
+				raise TypeError(
+					"Il modello passato a GMAR non accetta l'argomento `need_attn`. "
+					"Passa la ViT nuda o un LinearProbeModel che lo inoltri al backbone."
+				) from exc
+
 			targets = _resolve_target_classes(logits, target_category)
 			logits.gather(1, targets.unsqueeze(1)).sum().backward()
 

@@ -22,6 +22,7 @@ class CIFARResNet18(ResNet):
         self.embed_dim = 512
 
     def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        ''' return output of each layer, for feature extraction '''
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
 
@@ -30,13 +31,15 @@ class CIFARResNet18(ResNet):
         stage3 = self.layer3(stage2)     # [B, 256, H/4, W/4]
         stage4 = self.layer4(stage3)     # [B, 512, H/8, W/8]
 
-        return stage1, stage2, stage3, stage4
+        return stage1, stage2, stage3, stage4 
 
     def forward_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        ''' return the embedding bebore the classifier head '''
         *_, stage4 = self.forward_features(x)
         return torch.flatten(self.avgpool(stage4), 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ''' return the final classification output '''
         return self.fc(self.forward_embedding(x))
 
 class VisionTransformer(nn.Module):
@@ -106,24 +109,27 @@ class VisionTransformer(nn.Module):
         tokens = self.pos_drop(tokens)
         return tokens, c, hp, wp
 
-    def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Return one spatial feature map after every transformer block."""
+    def forward_features(self, x: torch.Tensor, need_attn: bool = False) -> Tuple[torch.Tensor, ...]:
+        """Return one spatial feature map without [CLS] for each transformer block (attention + MLP)."""
         b = x.size(0)
         tokens, c, hp, wp = self._prepare_tokens(x)
         features = []
-        for block in self.encoder:
-            tokens = block(tokens)
-            spatial = tokens[:, 1:, :].transpose(1, 2).reshape(b, c, hp, wp)
-            features.append(spatial)
-        return tuple(features)
-
-    def forward_embedding(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
-        tokens, _, _, _ = self._prepare_tokens(x)
+        class_tokens = []
         for block in self.encoder:
             tokens = block(tokens, need_attn=need_attn)
-        return self.norm(tokens[:, 0, :])
+            spatial = tokens[:, 1:, :].transpose(1, 2).reshape(b, c, hp, wp)
+            class_token = tokens[:, 0, :] #.unsqueeze(1).expand(-1, hp * wp, -1).transpose(1, 2).reshape(b, c, hp, wp)
+            features.append(spatial)
+            class_tokens.append(class_token)
+        return tuple(features), tuple(class_tokens)
+
+    def forward_embedding(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
+        '''Return the embedding of the [CLS] token after the transformer encoders'''
+        global_ClS_token = self.forward_features(x, need_attn=need_attn)[1][-1]  # Get the last class token
+        return self.norm(global_ClS_token)
 
     def forward(self, x: torch.Tensor, need_attn: bool = False) -> torch.Tensor:
+        '''return the final classification output'''
         return self.head(self.forward_embedding(x, need_attn=need_attn))
 
 class AttentionEncoder(nn.Module):

@@ -76,8 +76,14 @@ def get_probe_path_for_checkpoint(checkpoint_path: str) -> str:
 	raise ValueError(f"Checkpoint path is not in the expected layout: '{checkpoint_path}'")
 
 
-def get_milestone_summary_path(dataset: str, arch: str, paradigm: str) -> str:
-	return os.path.join(get_experiment_checkpoint_dir(dataset, arch, paradigm), "milestones.json")
+def get_probe_summary_path(dataset: str, arch: str, paradigm: str) -> str:
+	"""Return the summary path containing results for every periodic backbone probe."""
+	return os.path.join(get_experiment_checkpoint_dir(dataset, arch, paradigm), "probe_results.json")
+
+
+def get_relative_comparison_path(dataset: str, arch: str) -> str:
+	"""Return the cross-paradigm relative-accuracy comparison summary path."""
+	return os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_relative_accuracy_comparison.json")
 
 # Ensure required directories exist on launch
 for dir_path in [DIR_DATA, DIR_CHECKPOINTS, DIR_OUTPUT]:

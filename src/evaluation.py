@@ -130,6 +130,7 @@ def run_gradcam_pipeline(
 		device: torch.device,
 		num_samples: int = 8,
 		val_fraction: float = CONFIG["val_fraction"],
+		output_name: str | None = None,
 ) -> str:
 	"""Extract batched Grad-CAM and Guided Grad-CAM maps for test samples."""
 	model.eval().to(device)
@@ -184,7 +185,10 @@ def run_gradcam_pipeline(
 		axes[i, 2].axis("off")
 
 	plt.tight_layout()
-	output_filepath = os.path.join(DIR_OUTPUT, f"gradcam_{dataset_name}_{arch}_{paradigm}.png")
+	output_stem = f"gradcam_{dataset_name}_{arch}_{paradigm}"
+	if output_name:
+		output_stem = f"{output_stem}_{output_name}"
+	output_filepath = os.path.join(DIR_OUTPUT, f"{output_stem}.png")
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close(fig)
 
@@ -201,6 +205,7 @@ def run_GMAR_pipeline(
 		device: torch.device,
 		num_samples: int = 8,
 		val_fraction: float = CONFIG["val_fraction"],
+		output_name: str | None = None,
 ) -> str:
 	"""Extract batched GMAR maps for test samples."""
 	model.eval().to(device)
@@ -241,7 +246,10 @@ def run_GMAR_pipeline(
 		axes[i, 1].axis("off")
 
 	plt.tight_layout()
-	output_filepath = os.path.join(DIR_OUTPUT, f"gmar_{dataset_name}_{arch}_{paradigm}.png")
+	output_stem = f"gmar_{dataset_name}_{arch}_{paradigm}"
+	if output_name:
+		output_stem = f"{output_stem}_{output_name}"
+	output_filepath = os.path.join(DIR_OUTPUT, f"{output_stem}.png")
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close(fig)
 

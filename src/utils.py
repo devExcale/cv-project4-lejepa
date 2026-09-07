@@ -1,8 +1,7 @@
 import glob
 import json
 import os
-import shutil
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -11,19 +10,15 @@ import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from src.data import get_dataloaders, get_or_compute_stats
-from src.globals import (
-	CONFIG,
-	DATASETS,
-	DEVICE,
-	DIR_OUTPUT,
-	get_best_checkpoint_path,
-	get_experiment_checkpoint_dir,
-	get_milestone_summary_path,
-	get_periodic_checkpoint_path,
-	get_probe_checkpoint_path,
-	set_seed,
-)
+from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, DIR_OUTPUT, set_seed
 from src.network import AttentionEncoder, build_model
+
+
+def _guided_relu_backward_hook(module, grad_in, grad_out):
+	"""Clamp negative ReLU input gradients for guided backpropagation."""
+	if isinstance(grad_in[0], torch.Tensor):
+		return (torch.clamp(grad_in[0], min=0.0),)
+	return None
 
 
 class GuidedBackprop:
@@ -38,13 +33,9 @@ class GuidedBackprop:
 				module.inplace = False
 
 	def _register_hooks(self):
-		def relu_backward_hook(module, grad_in, grad_out):
-			if isinstance(grad_in[0], torch.Tensor):
-				return (torch.clamp(grad_in[0], min=0.0),)
-
 		for module in self.model.modules():
 			if isinstance(module, nn.ReLU):
-				self.hooks.append(module.register_full_backward_hook(relu_backward_hook))
+				self.hooks.append(module.register_full_backward_hook(_guided_relu_backward_hook))
 
 	def generate_gradients(
 		self,
@@ -266,73 +257,124 @@ class GMAR:
 		return saliency_map.detach()
 
 
-MILESTONE_PCTS = [15, 30, 45, 60, 75, 90]
+
+def load_probe_summary(dataset: str, arch: str, paradigm: str) -> Dict:
+	path = os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_{paradigm}", "probe_results.json")
+	if not os.path.exists(path):
+		raise FileNotFoundError(
+			f"No probe summary found for {dataset}/{arch}/{paradigm} at '{path}'. "
+			"Run mode 'probe' first."
+		)
+	with open(path, "r", encoding="utf-8") as file:
+		return json.load(file)
 
 
-def get_checkpoint_path(dataset: str, arch: str, paradigm: str, tag: str = "best") -> str:
-	"""Compatibility helper for callers that still ask for a checkpoint by tag."""
-	if tag == "best":
-		return get_best_checkpoint_path(dataset, arch, paradigm)
-	if tag.startswith("epoch_"):
-		tag = tag.removeprefix("epoch_")
-	try:
-		epoch = int(tag)
-	except ValueError as exc:
-		raise ValueError(f"Unrecognized checkpoint tag '{tag}'") from exc
-	return get_periodic_checkpoint_path(dataset, arch, paradigm, epoch)
+def build_relative_accuracy_comparison(dataset: str, arch: str) -> Dict:
+	"""Match all STD and LeJEPA checkpoints by nearest relative probe accuracy."""
+	std_summary = load_probe_summary(dataset, arch, "std")
+	lejepa_summary = load_probe_summary(dataset, arch, "lejepa")
+	std_records = list(std_summary["probe_results"])
+	lejepa_records = list(lejepa_summary["probe_results"])
 
+	std_to_lejepa = []
+	for reference in std_records:
+		valid = [record for record in lejepa_records if record.get("relative_accuracy") is not None]
+		matched = None
+		if reference.get("relative_accuracy") is not None and valid:
+			matched = min(
+				valid,
+				key=lambda record: (
+					abs(float(record["relative_accuracy"]) - float(reference["relative_accuracy"])),
+					abs(int(record["epoch"]) - int(reference["epoch"])),
+					int(record["epoch"]),
+				),
+			)
+		pair = {
+			"reference_epoch": int(reference["epoch"]),
+			"reference_val_acc": float(reference["val_acc"]),
+			"reference_relative_accuracy": reference.get("relative_accuracy"),
+			"reference_checkpoint_path": reference["checkpoint_path"],
+			"reference_probe_path": reference["probe_path"],
+			"matched_epoch": None,
+			"matched_val_acc": None,
+			"matched_relative_accuracy": None,
+			"matched_checkpoint_path": None,
+			"matched_probe_path": None,
+			"relative_accuracy_delta": None,
+		}
+		if matched is not None:
+			pair.update({
+				"matched_epoch": int(matched["epoch"]),
+				"matched_val_acc": float(matched["val_acc"]),
+				"matched_relative_accuracy": matched["relative_accuracy"],
+				"matched_checkpoint_path": matched["checkpoint_path"],
+				"matched_probe_path": matched["probe_path"],
+				"relative_accuracy_delta": abs(
+					float(reference["relative_accuracy"]) - float(matched["relative_accuracy"])
+				),
+			})
+		std_to_lejepa.append(pair)
 
-def list_periodic_checkpoints(dataset: str, arch: str, paradigm: str) -> List[str]:
-	root = get_experiment_checkpoint_dir(dataset, arch, paradigm)
-	pattern = os.path.join(root, "epoch_*", "checkpoint_*.pt")
-	return sorted(glob.glob(pattern), key=_epoch_from_checkpoint)
+	lejepa_to_std = []
+	for reference in lejepa_records:
+		valid = [record for record in std_records if record.get("relative_accuracy") is not None]
+		matched = None
+		if reference.get("relative_accuracy") is not None and valid:
+			matched = min(
+				valid,
+				key=lambda record: (
+					abs(float(record["relative_accuracy"]) - float(reference["relative_accuracy"])),
+					abs(int(record["epoch"]) - int(reference["epoch"])),
+					int(record["epoch"]),
+				),
+			)
+		pair = {
+			"reference_epoch": int(reference["epoch"]),
+			"reference_val_acc": float(reference["val_acc"]),
+			"reference_relative_accuracy": reference.get("relative_accuracy"),
+			"reference_checkpoint_path": reference["checkpoint_path"],
+			"reference_probe_path": reference["probe_path"],
+			"matched_epoch": None,
+			"matched_val_acc": None,
+			"matched_relative_accuracy": None,
+			"matched_checkpoint_path": None,
+			"matched_probe_path": None,
+			"relative_accuracy_delta": None,
+		}
+		if matched is not None:
+			pair.update({
+				"matched_epoch": int(matched["epoch"]),
+				"matched_val_acc": float(matched["val_acc"]),
+				"matched_relative_accuracy": matched["relative_accuracy"],
+				"matched_checkpoint_path": matched["checkpoint_path"],
+				"matched_probe_path": matched["probe_path"],
+				"relative_accuracy_delta": abs(
+					float(reference["relative_accuracy"]) - float(matched["relative_accuracy"])
+				),
+			})
+		lejepa_to_std.append(pair)
 
-
-def _epoch_from_checkpoint(path: str) -> int:
-	parent = os.path.basename(os.path.dirname(path))
-	if parent.startswith("epoch_"):
-		return int(parent.removeprefix("epoch_"))
-	# Fallback for legacy flat checkpoint names.
-	return int(os.path.splitext(path)[0].rsplit("_", 1)[-1])
-
-
-def _probe_record_from_result(epoch: int, checkpoint_path: str, probe_path: str, result: Dict) -> Dict:
-	return {
-		"epoch": int(epoch),
-		"path": checkpoint_path,
-		"probe_path": probe_path,
-		"val_acc": float(result["best_val_acc"]),
-		"test_acc": float(result["test_acc"]),
-		"test_loss": float(result["test_loss"]),
-		"probe_best_epoch": int(result["best_epoch"]),
+	comparison = {
+		"dataset": dataset,
+		"arch": arch,
+		"chance_accuracy": float(std_summary["chance_accuracy"]),
+		"relative_accuracy_definition": (
+			"100 * (val_acc - chance_accuracy) / (accuracy_final - chance_accuracy)"
+		),
+		"std_accuracy_final": float(std_summary["accuracy_final"]),
+		"lejepa_accuracy_final": float(lejepa_summary["accuracy_final"]),
+		"std_to_lejepa": std_to_lejepa,
+		"lejepa_to_std": lejepa_to_std,
 	}
 
-
-def _probe_payload_is_compatible(
-	payload: Dict,
-	dataset: str,
-	arch: str,
-	paradigm: str,
-	backbone_epoch: int,
-	probe_epochs: int,
-	probe_lr: float,
-) -> bool:
-	return (
-		payload.get("completed", False)
-		and payload.get("test_loss") is not None
-		and payload.get("test_acc") is not None
-		and int(payload.get("target_probe_epochs", -1)) == int(probe_epochs)
-		and int(payload.get("num_classes", -1)) == int(DATASETS[dataset]["num_classes"])
-		and float(payload.get("lr", float("nan"))) == float(probe_lr)
-		and float(payload.get("weight_decay", float("nan"))) == 0.0
-		and payload.get("dataset") == dataset
-		and payload.get("arch") == arch
-		and payload.get("paradigm") == paradigm
-		and int(payload.get("backbone_epoch", -1)) == int(backbone_epoch)
-	)
+	path = os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_relative_accuracy_comparison.json")
+	with open(path, "w", encoding="utf-8") as file:
+		json.dump(comparison, file, indent=2)
+	print(f"[Relative Accuracy] Comparison saved to {path}")
+	return comparison
 
 
-def select_and_prune_milestones(
+def probe_all_checkpoints(
 	dataset: str,
 	arch: str,
 	paradigm: str,
@@ -347,14 +389,14 @@ def select_and_prune_milestones(
 	lamb: float = CONFIG["lejepa_lambda"],
 	resume: bool = False,
 ) -> Dict:
-	"""Probe periodic checkpoints, select relative milestones, and prune unneeded epochs."""
+	"""Train/resume one persistent linear probe for every periodic backbone checkpoint."""
 	from src.evaluation import linear_probe
 
-	paths = list_periodic_checkpoints(dataset, arch, paradigm)
+	root = os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_{paradigm}")
+	paths = sorted(glob.glob(os.path.join(root, "epoch_*", "checkpoint_*.pt")))
 	if not paths:
 		raise FileNotFoundError(
-			f"No periodic checkpoints found for {dataset}/{arch}/{paradigm}. "
-			"Train first, or point this project at the checkpoint directory containing the periodic files."
+			f"No periodic checkpoints found for {dataset}/{arch}/{paradigm}. Train first."
 		)
 
 	set_seed(CONFIG["seed"])
@@ -366,53 +408,11 @@ def select_and_prune_milestones(
 		include_test=True,
 	)
 
-	if resume:
-		completed_epochs = []
-		for checkpoint_path in paths:
-			epoch = _epoch_from_checkpoint(checkpoint_path)
-			probe_path = get_probe_checkpoint_path(dataset, arch, paradigm, epoch=epoch)
-			if not os.path.exists(probe_path):
-				continue
-			try:
-				probe_payload = torch.load(probe_path, map_location="cpu")
-			except Exception:
-				continue
-			if _probe_payload_is_compatible(
-				probe_payload, dataset, arch, paradigm, epoch, probe_epochs, probe_lr
-			):
-				completed_epochs.append(epoch)
-		if completed_epochs:
-			print(
-				f"[Probe Resume] Last completed backbone probe is epoch {max(completed_epochs)}. "
-				"Compatible completed probes will be reused; a partial next probe will resume in-place."
-			)
-
 	records = []
-	for path in paths:
-		epoch = _epoch_from_checkpoint(path)
-		probe_path = get_probe_checkpoint_path(dataset, arch, paradigm, epoch=epoch)
-
-		if resume and os.path.exists(probe_path):
-			try:
-				probe_payload = torch.load(probe_path, map_location="cpu")
-			except Exception:
-				probe_payload = None
-			if probe_payload is not None and _probe_payload_is_compatible(
-				probe_payload, dataset, arch, paradigm, epoch, probe_epochs, probe_lr
-			):
-				print(
-					f"[Probe Resume] Reusing completed probe for backbone epoch {epoch}: {probe_path}"
-				)
-				records.append({
-					"epoch": int(epoch),
-					"path": path,
-					"probe_path": probe_path,
-					"val_acc": float(probe_payload["best_val_acc"]),
-					"test_acc": float(probe_payload["test_acc"]),
-					"test_loss": float(probe_payload["test_loss"]),
-					"probe_best_epoch": int(probe_payload["best_probe_epoch"]),
-				})
-				continue
+	for checkpoint_path in paths:
+		epoch_dir = os.path.basename(os.path.dirname(checkpoint_path))
+		epoch = int(epoch_dir.removeprefix("epoch_"))
+		probe_path = os.path.join(os.path.dirname(checkpoint_path), f"probe_{epoch:04d}.pt")
 
 		model = build_model(
 			arch,
@@ -423,10 +423,10 @@ def select_and_prune_milestones(
 			n_points=n_points,
 			lamb=lamb,
 		).to(device)
-		checkpoint = torch.load(path, map_location=device)
+		checkpoint = torch.load(checkpoint_path, map_location=device)
 		model.load_state_dict(checkpoint["model_state_dict"])
 
-		print(f"[Probe] Backbone epoch {epoch}: {path}")
+		print(f"[Probe] Backbone epoch {epoch}: {checkpoint_path}")
 		result = linear_probe(
 			model,
 			probe_train,
@@ -442,81 +442,94 @@ def select_and_prune_milestones(
 				"dataset": dataset,
 				"arch": arch,
 				"paradigm": paradigm,
-				"backbone_epoch": int(epoch),
-				"backbone_checkpoint_path": path,
+				"backbone_epoch": epoch,
+				"backbone_checkpoint_path": checkpoint_path,
 			},
 		)
+		# linear_probe() persists its state every probe epoch and writes completed=True
+		# before returning. Verify that durable file before advancing to the next backbone.
+		if not os.path.exists(probe_path):
+			raise RuntimeError(f"Probe finished but was not saved: '{probe_path}'")
+		probe_checkpoint = torch.load(probe_path, map_location="cpu")
+		if not probe_checkpoint.get("completed", False):
+			raise RuntimeError(f"Probe returned without a completed checkpoint: '{probe_path}'")
 
-		records.append(_probe_record_from_result(epoch, path, probe_path, result))
+		record = {
+			"epoch": epoch,
+			"checkpoint_path": checkpoint_path,
+			"probe_path": probe_path,
+			"val_acc": float(result["best_val_acc"]),
+			"test_acc": float(result["test_acc"]),
+			"test_loss": float(result["test_loss"]),
+			"probe_best_epoch": int(result["best_epoch"]),
+			"probe_stopped_epoch": int(result.get("probe_epoch", result["best_epoch"])),
+			"probe_stop_reason": result.get("stop_reason", "completed"),
+			"probe_converged": bool(result.get("converged", False)),
+		}
+		records.append(record)
+
+		# Persist the probe/backbone association immediately. Relative accuracy is
+		# filled in after the full trajectory is known, but completed probe work is
+		# never held only in memory.
+		checkpoint = torch.load(checkpoint_path, map_location="cpu")
+		checkpoint["probe"] = {
+			"path": probe_path,
+			"completed": True,
+			"best_val_acc": record["val_acc"],
+			"test_acc": record["test_acc"],
+			"best_probe_epoch": record["probe_best_epoch"],
+			"relative_accuracy": None,
+		}
+		torch.save(checkpoint, checkpoint_path)
+		print(f"[Probe] Saved completed probe immediately: {probe_path}")
 
 		del model
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
 
-	# The best representation checkpoint is chosen only from probe validation accuracy.
-	# Test accuracy is stored for reporting and never used for checkpoint selection.
 	best = max(records, key=lambda record: (record["val_acc"], -record["epoch"]))
-	chance = 100.0 / DATASETS[dataset]["num_classes"]
-	accuracy_final = best["val_acc"]
-
-	milestone_map = {}
-	for milestone in MILESTONE_PCTS:
-		target = chance + (milestone / 100.0) * (accuracy_final - chance)
-		chosen = min(
-			records,
-			key=lambda record: (abs(record["val_acc"] - target), record["epoch"]),
-		)
-		milestone_map[milestone] = {
-			"target_val_acc": target,
-			"epoch": chosen["epoch"],
-			"val_acc": chosen["val_acc"],
-			"test_acc": chosen["test_acc"],
-			"checkpoint_path": chosen["path"],
-			"probe_path": chosen["probe_path"],
-		}
-
-	# Several relative milestones may legitimately map to the same periodic checkpoint.
-	labels_by_epoch = {}
-	for milestone, info in milestone_map.items():
-		labels_by_epoch.setdefault(info["epoch"], []).append(milestone)
-
-	# Retain every milestone checkpoint and the checkpoint with the best probe validation accuracy.
-	# Probe files are colocated with their checkpoint and are pruned together with unneeded epochs.
-	keep_epochs = set(labels_by_epoch) | {best["epoch"]}
-	retained = []
-	retained_probes = []
+	chance_accuracy = 100.0 / DATASETS[dataset]["num_classes"]
+	accuracy_final = float(best["val_acc"])
+	denominator = accuracy_final - chance_accuracy
 
 	for record in records:
-		epoch_dir = os.path.dirname(record["path"])
-		if record["epoch"] not in keep_epochs:
-			shutil.rmtree(epoch_dir)
-			continue
-
-		checkpoint = torch.load(record["path"], map_location="cpu")
-		checkpoint["milestones"] = sorted(labels_by_epoch.get(record["epoch"], []))
-		checkpoint["is_best_probe_checkpoint"] = record["epoch"] == best["epoch"]
-		checkpoint["probe_path"] = record["probe_path"]
-		torch.save(checkpoint, record["path"])
+		record["relative_accuracy"] = (
+			None
+			if denominator <= 0.0
+			else 100.0 * (float(record["val_acc"]) - chance_accuracy) / denominator
+		)
 
 		probe = torch.load(record["probe_path"], map_location="cpu")
-		probe["milestones"] = sorted(labels_by_epoch.get(record["epoch"], []))
-		probe["is_best_probe_checkpoint"] = record["epoch"] == best["epoch"]
+		probe["chance_accuracy"] = chance_accuracy
+		probe["accuracy_final"] = accuracy_final
+		probe["relative_accuracy"] = record["relative_accuracy"]
 		torch.save(probe, record["probe_path"])
 
-		retained.append(record["path"])
-		retained_probes.append(record["probe_path"])
+		checkpoint = torch.load(record["checkpoint_path"], map_location="cpu")
+		checkpoint["probe"] = {
+			"path": record["probe_path"],
+			"completed": True,
+			"best_val_acc": record["val_acc"],
+			"test_acc": record["test_acc"],
+			"best_probe_epoch": record["probe_best_epoch"],
+			"relative_accuracy": record["relative_accuracy"],
+		}
+		torch.save(checkpoint, record["checkpoint_path"])
 
 	summary = {
 		"dataset": dataset,
 		"arch": arch,
 		"paradigm": paradigm,
-		"chance_accuracy": chance,
+		"chance_accuracy": chance_accuracy,
 		"accuracy_final": accuracy_final,
+		"relative_accuracy_definition": (
+			"100 * (val_acc - chance_accuracy) / (accuracy_final - chance_accuracy)"
+		),
 		"last_probed_epoch": max(record["epoch"] for record in records),
-		"best_epoch": best["epoch"],
-		"best_val_acc": best["val_acc"],
-		"best_test_acc": best["test_acc"],
-		"best_checkpoint_path": best["path"],
+		"best_epoch": int(best["epoch"]),
+		"best_val_acc": float(best["val_acc"]),
+		"best_test_acc": float(best["test_acc"]),
+		"best_checkpoint_path": best["checkpoint_path"],
 		"best_probe_path": best["probe_path"],
 		"model_config": {
 			"num_slices": num_slices,
@@ -527,20 +540,27 @@ def select_and_prune_milestones(
 		"probe_config": {
 			"epochs": probe_epochs,
 			"lr": probe_lr,
+			"convergence_cutoff": CONFIG["probe_convergence_cutoff"],
+			"convergence_patience": CONFIG["probe_convergence_patience"],
 		},
-		"milestones": milestone_map,
-		"retained_checkpoints": retained,
-		"retained_probes": retained_probes,
-		"all_probe_results": records,
+		"probe_results": records,
 	}
 
-	summary_path = get_milestone_summary_path(dataset, arch, paradigm)
+	summary_path = os.path.join(root, "probe_results.json")
 	with open(summary_path, "w", encoding="utf-8") as file:
 		json.dump(summary, file, indent=2)
+	print(f"[Probes] Summary saved to {summary_path}")
 
-	print(f"[Milestones] Summary saved to {summary_path}")
+	other_paradigm = "lejepa" if paradigm == "std" else "std"
+	other_summary_path = os.path.join(
+		DIR_CHECKPOINTS,
+		f"{dataset}_{arch}_{other_paradigm}",
+		"probe_results.json",
+	)
+	if os.path.exists(other_summary_path):
+		build_relative_accuracy_comparison(dataset, arch)
+
 	return summary
-
 
 def denormalize(
 	images: torch.Tensor,
@@ -564,6 +584,7 @@ def _run_pca_checkpoint(
 	val_fraction: float,
 	model_config: Dict,
 	output_name: str,
+	probe_record: Dict | None = None,
 ):
 	from src.evaluation import pca_outputs
 
@@ -581,7 +602,7 @@ def _run_pca_checkpoint(
 	model.eval()
 
 	epoch = int(checkpoint.get("epoch", -1))
-	milestone_labels = sorted(checkpoint.get("milestones", []))
+	probe_record = probe_record or {}
 	output_root = os.path.join(
 		DIR_OUTPUT,
 		"pca",
@@ -623,10 +644,13 @@ def _run_pca_checkpoint(
 						"architecture": arch,
 						"paradigm": paradigm,
 						"epoch": epoch,
-						"milestones": milestone_labels,
 						"layer_index": layer_index,
 						"pca_components": 3,
 						"checkpoint_path": checkpoint_path,
+						"probe_path": probe_record.get("probe_path"),
+						"probe_val_acc": probe_record.get("val_acc"),
+						"probe_test_acc": probe_record.get("test_acc"),
+						"relative_accuracy": probe_record.get("relative_accuracy"),
 					}
 
 					payload = {
@@ -641,7 +665,7 @@ def _run_pca_checkpoint(
 					save_image(originals[batch_index], os.path.join(result_dir, "original.png"))
 					save_image(result["rgb"].permute(2, 0, 1), os.path.join(result_dir, "pca_rgb.png"))
 					save_image(result["mask"].float().unsqueeze(0), os.path.join(result_dir, "pca_mask.png"))
-					with open(os.path.join(result_dir, "metadata.json"), "w") as file:
+					with open(os.path.join(result_dir, "metadata.json"), "w", encoding="utf-8") as file:
 						json.dump(metadata, file, indent=2)
 
 				sample_index += 1
@@ -653,52 +677,14 @@ def _run_pca_checkpoint(
 	)
 
 
-def run_pca_for_checkpoint(
-	checkpoint_path: str,
-	dataset: str,
-	arch: str,
-	paradigm: str,
-	batch_size: int,
-	device: torch.device,
-	num_samples: int = 8,
-	val_fraction: float = CONFIG["val_fraction"],
-	model_config: Dict | None = None,
-):
-	"""Run PCA only on one explicitly chosen checkpoint (for example best/checkpoint_best.pt)."""
-	if num_samples < 1:
-		return
-
-	_, _, test_loader = get_dataloaders(
-		dataset,
-		batch_size=batch_size,
-		paradigm="std",
-		val_fraction=val_fraction,
-		include_test=True,
-	)
-	checkpoint = torch.load(checkpoint_path, map_location="cpu")
-	epoch = int(checkpoint.get("epoch", -1))
-	_run_pca_checkpoint(
-		checkpoint_path,
-		dataset,
-		arch,
-		paradigm,
-		test_loader,
-		device,
-		num_samples,
-		val_fraction,
-		model_config or {},
-		f"best_epoch_{epoch:04d}",
-	)
-
-
-def run_pca_for_milestones(
+def run_pca_for_all_checkpoints(
 	summary: Dict,
 	batch_size: int,
 	device: torch.device,
 	num_samples: int,
 	val_fraction: float = CONFIG["val_fraction"],
 ):
-	"""Run the original SVD-based spatial PCA on a fixed test subset for every milestone checkpoint."""
+	"""Run PCA on every backbone checkpoint represented in the probe summary."""
 	if num_samples < 1:
 		return
 
@@ -715,17 +701,12 @@ def run_pca_for_milestones(
 		include_test=True,
 	)
 
-	milestone_epochs = sorted({info["epoch"] for info in summary["milestones"].values()})
-	for epoch in milestone_epochs:
-		path = next(
-			checkpoint_path
-			for checkpoint_path in summary["retained_checkpoints"]
-			if _epoch_from_checkpoint(checkpoint_path) == epoch
-		)
-		checkpoint = torch.load(path, map_location="cpu")
-		milestone_labels = sorted(checkpoint.get("milestones", []))
+	for record in summary["probe_results"]:
+		epoch = int(record["epoch"])
+		relative = record.get("relative_accuracy")
+		relative_tag = "na" if relative is None else f"{float(relative):06.2f}"
 		_run_pca_checkpoint(
-			path,
+			record["checkpoint_path"],
 			dataset,
 			arch,
 			paradigm,
@@ -734,7 +715,8 @@ def run_pca_for_milestones(
 			num_samples,
 			val_fraction,
 			model_config,
-			f"epoch_{epoch:04d}_milestones_{'-'.join(map(str, milestone_labels))}",
+			f"epoch_{epoch:04d}_relative_{relative_tag}",
+			probe_record=record,
 		)
 
 

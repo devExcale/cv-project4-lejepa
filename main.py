@@ -1,27 +1,19 @@
 import argparse
-import json
 import os
 
 import torch
 import torch.nn as nn
 
 from src.data import get_dataloaders
-from src.evaluation import evaluate_model, linear_probe, run_GMAR_pipeline, run_gradcam_pipeline
-from src.globals import (
-    CONFIG,
-    DATASETS,
-    DEVICE,
-    get_best_checkpoint_path,
-    get_milestone_summary_path,
-    get_probe_path_for_checkpoint,
-    set_seed,
-)
+from src.evaluation import evaluate_model, run_GMAR_pipeline, run_gradcam_pipeline
+from src.globals import CONFIG, DATASETS, DEVICE, set_seed
 from src.network import LinearProbeModel, build_model
 from src.train import train_lejepa, train_supervised
 from src.utils import (
-    run_pca_for_checkpoint,
-    run_pca_for_milestones,
-    select_and_prune_milestones,
+    build_relative_accuracy_comparison,
+    load_probe_summary,
+    probe_all_checkpoints,
+    run_pca_for_all_checkpoints,
     test_config,
     test_cuda,
     test_pipeline,
@@ -34,7 +26,8 @@ def parse_args():
         "mode",
         choices=[
             "train",
-            "select_milestones",
+            "probe",
+            "compare_relative",
             "eval",
             "pca",
             "gradcam",
@@ -62,129 +55,7 @@ def parse_args():
     parser.add_argument("--lejepa_lambda", type=float, default=CONFIG["lejepa_lambda"])
     parser.add_argument("-r", "--resume", action="store_true")
     parser.add_argument("--skip_postprocess", action="store_true")
-    parser.add_argument("--skip_milestones", action="store_true")
     return parser.parse_args()
-
-
-def _summary_path(args):
-    return get_milestone_summary_path(args.dataset, args.arch, args.paradigm)
-
-
-def _training_best_path(args):
-    return get_best_checkpoint_path(args.dataset, args.arch, args.paradigm)
-
-
-def _load_summary(args):
-    path = _summary_path(args)
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"No milestone summary found at '{path}'. "
-            "Run 'select_milestones' first, or use --skip_milestones for pca/gradcam/GMAR."
-        )
-    with open(path, "r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def _best_retained_checkpoint(summary):
-    best_path = summary.get("best_checkpoint_path")
-    if best_path and os.path.exists(best_path):
-        return best_path
-    best_epoch = int(summary["best_epoch"])
-    for path in summary["retained_checkpoints"]:
-        parent = os.path.basename(os.path.dirname(path))
-        if parent.startswith("epoch_") and int(parent.removeprefix("epoch_")) == best_epoch:
-            return path
-    raise FileNotFoundError(
-        f"Retained checkpoint for best probe epoch {best_epoch} is missing."
-    )
-
-
-def _select_milestones(args, device):
-    return select_and_prune_milestones(
-        args.dataset,
-        args.arch,
-        args.paradigm,
-        batch_size=args.batch_size,
-        device=device,
-        val_fraction=args.val_fraction,
-        probe_epochs=args.probe_epochs,
-        probe_lr=args.probe_lr,
-        num_slices=args.sigreg_slices,
-        t_max=args.sigreg_tmax,
-        n_points=args.sigreg_points,
-        lamb=args.lejepa_lambda,
-        resume=args.resume,
-    )
-
-
-def _model_config(args):
-    return {
-        "num_slices": args.sigreg_slices,
-        "t_max": args.sigreg_tmax,
-        "n_points": args.sigreg_points,
-        "lamb": args.lejepa_lambda,
-    }
-
-
-def _load_checkpoint_into_model(path: str, model: nn.Module):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Checkpoint not found: '{path}'")
-    checkpoint = torch.load(path, map_location="cpu")
-    model.load_state_dict(checkpoint["model_state_dict"])
-    return checkpoint
-
-
-def _probe_backbone(model: nn.Module, paradigm: str) -> nn.Module:
-    return model.backbone if paradigm == "lejepa" else model
-
-
-def _ensure_linear_probe(
-    checkpoint_path: str,
-    checkpoint: dict,
-    model: nn.Module,
-    args,
-    device: torch.device,
-    probe_train,
-    probe_val,
-    probe_test,
-):
-    probe_path = get_probe_path_for_checkpoint(checkpoint_path)
-    backbone = _probe_backbone(model, args.paradigm)
-    backbone_epoch = int(checkpoint.get("epoch", -1))
-
-    print(f"[Linear probe] Ensuring probe for '{checkpoint_path}'.")
-    result = linear_probe(
-        backbone,
-        probe_train,
-        probe_val,
-        probe_test,
-        num_classes=DATASETS[args.dataset]["num_classes"],
-        device=device,
-        epochs=args.probe_epochs,
-        lr=args.probe_lr,
-        probe_checkpoint_path=probe_path,
-        resume=True,
-        metadata={
-            "dataset": args.dataset,
-            "arch": args.arch,
-            "paradigm": args.paradigm,
-            "backbone_epoch": backbone_epoch,
-            "backbone_checkpoint_path": checkpoint_path,
-        },
-    )
-    probe_checkpoint = torch.load(probe_path, map_location="cpu")
-    print(
-        f"[Linear probe] Probe available at '{probe_path}' | "
-        f"Val Acc {float(result['best_val_acc']):.2f}% | Test Acc {float(result['test_acc']):.2f}%"
-    )
-    return probe_checkpoint
-
-
-def _build_probe_classifier(model: nn.Module, probe_checkpoint: dict, args, device: torch.device):
-    backbone = _probe_backbone(model, args.paradigm)
-    head = nn.Linear(backbone.embed_dim, DATASETS[args.dataset]["num_classes"])
-    head.load_state_dict(probe_checkpoint["head_state_dict"])
-    return LinearProbeModel(backbone, head).to(device)
 
 
 def main():
@@ -192,6 +63,12 @@ def main():
 
     if args.mode == "test_cuda":
         test_cuda()
+        return
+
+    if args.mode == "compare_relative":
+        if not (args.dataset and args.arch):
+            raise ValueError("Mode 'compare_relative' requires dataset and arch")
+        build_relative_accuracy_comparison(args.dataset, args.arch)
         return
 
     if not (args.dataset and args.arch and args.paradigm):
@@ -205,33 +82,43 @@ def main():
         test_pipeline(args.dataset, args.arch, args.paradigm)
         return
 
-    if args.skip_milestones and args.mode not in ("pca", "gradcam", "GMAR"):
-        raise ValueError("--skip_milestones is only valid with pca, gradcam, or GMAR mode.")
-
     if args.mode == "eval" and args.paradigm == "lejepa":
         raise ValueError(
-            "LeJEPA models have no standalone validation method. "
-            "Use linear-probe validation/test accuracy to judge representation quality."
+            "LeJEPA models have no standalone supervised head to evaluate. "
+            "Use the stored linear-probe validation/test accuracy instead."
         )
 
     set_seed(CONFIG["seed"])
     device = torch.device(args.device)
 
-    if args.mode == "select_milestones":
-        _select_milestones(args, device)
+    if args.mode == "probe":
+        probe_all_checkpoints(
+            args.dataset,
+            args.arch,
+            args.paradigm,
+            batch_size=args.batch_size,
+            device=device,
+            val_fraction=args.val_fraction,
+            probe_epochs=args.probe_epochs,
+            probe_lr=args.probe_lr,
+            num_slices=args.sigreg_slices,
+            t_max=args.sigreg_tmax,
+            n_points=args.sigreg_points,
+            lamb=args.lejepa_lambda,
+            resume=args.resume,
+        )
         return
 
-    model = build_model(
-        args.arch,
-        args.dataset,
-        args.paradigm,
-        num_slices=args.sigreg_slices,
-        t_max=args.sigreg_tmax,
-        n_points=args.sigreg_points,
-        lamb=args.lejepa_lambda,
-    ).to(device)
-
     if args.mode == "train":
+        model = build_model(
+            args.arch,
+            args.dataset,
+            args.paradigm,
+            num_slices=args.sigreg_slices,
+            t_max=args.sigreg_tmax,
+            n_points=args.sigreg_points,
+            lamb=args.lejepa_lambda,
+        ).to(device)
         train_loader, val_loader = get_dataloaders(
             args.dataset,
             args.batch_size,
@@ -269,48 +156,53 @@ def main():
 
         if args.skip_postprocess:
             print(
-                "[Postprocess skipped] Periodic checkpoints were left untouched. "
-                "Run mode 'select_milestones' later if milestone analysis is wanted."
+                "[Postprocess skipped] Backbone checkpoints were left untouched. "
+                "Run mode 'probe' later to train/resume one probe for every periodic checkpoint."
             )
             return
 
-        _select_milestones(args, device)
+        probe_all_checkpoints(
+            args.dataset,
+            args.arch,
+            args.paradigm,
+            batch_size=args.batch_size,
+            device=device,
+            val_fraction=args.val_fraction,
+            probe_epochs=args.probe_epochs,
+            probe_lr=args.probe_lr,
+            num_slices=args.sigreg_slices,
+            t_max=args.sigreg_tmax,
+            n_points=args.sigreg_points,
+            lamb=args.lejepa_lambda,
+            resume=args.resume,
+        )
         return
 
     if args.mode == "pca":
-        if args.skip_milestones:
-            checkpoint_path = _training_best_path(args)
-            if not os.path.exists(checkpoint_path):
-                raise FileNotFoundError(
-                    f"Training-time best checkpoint not found at '{checkpoint_path}'. Train first."
-                )
-            print(f"[PCA] Using training-time best checkpoint: {checkpoint_path}")
-            run_pca_for_checkpoint(
-                checkpoint_path,
-                args.dataset,
-                args.arch,
-                args.paradigm,
-                args.batch_size,
-                device,
-                num_samples=args.pca_samples,
-                val_fraction=args.val_fraction,
-                model_config=_model_config(args),
-            )
-        else:
-            summary = _load_summary(args)
-            run_pca_for_milestones(
-                summary,
-                args.batch_size,
-                device,
-                args.pca_samples,
-                val_fraction=args.val_fraction,
-            )
+        summary = load_probe_summary(args.dataset, args.arch, args.paradigm)
+        run_pca_for_all_checkpoints(
+            summary,
+            args.batch_size,
+            device,
+            args.pca_samples,
+            val_fraction=args.val_fraction,
+        )
         return
 
     if args.mode == "eval":
-        summary = _load_summary(args)
-        checkpoint_path = _best_retained_checkpoint(summary)
-        checkpoint = _load_checkpoint_into_model(checkpoint_path, model)
+        summary = load_probe_summary(args.dataset, args.arch, args.paradigm)
+        checkpoint_path = summary["best_checkpoint_path"]
+        model = build_model(
+            args.arch,
+            args.dataset,
+            args.paradigm,
+            num_slices=args.sigreg_slices,
+            t_max=args.sigreg_tmax,
+            n_points=args.sigreg_points,
+            lamb=args.lejepa_lambda,
+        ).to(device)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"])
         _, _, test_loader = get_dataloaders(
             args.dataset,
             args.batch_size,
@@ -318,12 +210,9 @@ def main():
             val_fraction=args.val_fraction,
             include_test=True,
         )
-        print(f"Best checkpoint selected by linear-probe validation accuracy: {checkpoint_path}")
-        probe_path = get_probe_path_for_checkpoint(checkpoint_path)
-        if os.path.exists(probe_path):
-            probe_checkpoint = torch.load(probe_path, map_location="cpu")
-            print(f"Stored probe val accuracy:  {probe_checkpoint['best_val_acc']:.2f}%")
-            print(f"Stored probe test accuracy: {probe_checkpoint['test_acc']:.2f}%")
+        print(f"Best checkpoint by linear-probe validation accuracy: {checkpoint_path}")
+        print(f"Stored probe val accuracy:  {float(summary['best_val_acc']):.2f}%")
+        print(f"Stored probe test accuracy: {float(summary['best_test_acc']):.2f}%")
         print("Original supervised head test performance:")
         evaluate_model(model, test_loader, device, verbose=True)
         return
@@ -334,60 +223,84 @@ def main():
         if args.mode == "GMAR" and args.arch != "vit":
             raise ValueError("GMAR requires arch='vit'.")
 
-        if args.skip_milestones:
-            checkpoint_path = _training_best_path(args)
-            checkpoint_source = "training-time best checkpoint"
-        else:
-            summary = _load_summary(args)
-            checkpoint_path = _best_retained_checkpoint(summary)
-            checkpoint_source = "best milestone checkpoint by probe validation accuracy"
-
-        checkpoint = _load_checkpoint_into_model(checkpoint_path, model)
-        probe_train, probe_val, test_loader = get_dataloaders(
+        summary = load_probe_summary(args.dataset, args.arch, args.paradigm)
+        _, _, test_loader = get_dataloaders(
             args.dataset,
             args.batch_size,
             paradigm="std",
             val_fraction=args.val_fraction,
             include_test=True,
         )
-        probe_checkpoint = _ensure_linear_probe(
-            checkpoint_path,
-            checkpoint,
-            model,
-            args,
-            device,
-            probe_train,
-            probe_val,
-            test_loader,
-        )
-        probe_model = _build_probe_classifier(model, probe_checkpoint, args, device)
 
-        print(f"Using {checkpoint_source}: {checkpoint_path}")
-        print(f"Linear-probe val accuracy:  {probe_checkpoint['best_val_acc']:.2f}%")
-        print(f"Linear-probe test accuracy: {probe_checkpoint['test_acc']:.2f}%")
+        for record in summary["probe_results"]:
+            if not os.path.exists(record["probe_path"]):
+                raise FileNotFoundError(
+                    f"Probe checkpoint missing for backbone epoch {record['epoch']}: "
+                    f"'{record['probe_path']}'. Run mode 'probe' first."
+                )
 
-        if args.mode == "gradcam":
-            run_gradcam_pipeline(
-                probe_model,
-                test_loader,
-                args.dataset,
+            model = build_model(
                 args.arch,
-                args.paradigm,
-                device,
-                num_samples=8,
-                val_fraction=args.val_fraction,
-            )
-        else:
-            run_GMAR_pipeline(
-                probe_model,
-                test_loader,
                 args.dataset,
-                args.arch,
                 args.paradigm,
-                device,
-                num_samples=8,
-                val_fraction=args.val_fraction,
+                num_slices=args.sigreg_slices,
+                t_max=args.sigreg_tmax,
+                n_points=args.sigreg_points,
+                lamb=args.lejepa_lambda,
+            ).to(device)
+            checkpoint = torch.load(record["checkpoint_path"], map_location="cpu")
+            model.load_state_dict(checkpoint["model_state_dict"])
+
+            probe_checkpoint = torch.load(record["probe_path"], map_location="cpu")
+            if not probe_checkpoint.get("completed", False):
+                raise RuntimeError(
+                    f"Probe for backbone epoch {record['epoch']} is incomplete. "
+                    "Resume mode 'probe' before running interpretability analysis."
+                )
+
+            backbone = model.backbone if args.paradigm == "lejepa" else model
+            head = nn.Linear(backbone.embed_dim, DATASETS[args.dataset]["num_classes"])
+            head.load_state_dict(probe_checkpoint["head_state_dict"])
+            probe_model = LinearProbeModel(backbone, head).to(device)
+
+            relative = record.get("relative_accuracy")
+            relative_tag = "na" if relative is None else f"{float(relative):06.2f}"
+            output_name = f"epoch_{int(record['epoch']):04d}_relative_{relative_tag}"
+            print(
+                f"[{args.mode}] Epoch {int(record['epoch']):04d} | "
+                f"Val Acc {float(probe_checkpoint['best_val_acc']):.2f}% | "
+                f"Test Acc {float(probe_checkpoint['test_acc']):.2f}% | "
+                f"Relative Acc {relative}"
             )
+
+            if args.mode == "gradcam":
+                run_gradcam_pipeline(
+                    probe_model,
+                    test_loader,
+                    args.dataset,
+                    args.arch,
+                    args.paradigm,
+                    device,
+                    num_samples=8,
+                    val_fraction=args.val_fraction,
+                    output_name=output_name,
+                )
+            else:
+                run_GMAR_pipeline(
+                    probe_model,
+                    test_loader,
+                    args.dataset,
+                    args.arch,
+                    args.paradigm,
+                    device,
+                    num_samples=8,
+                    val_fraction=args.val_fraction,
+                    output_name=output_name,
+                )
+
+            del probe_model, model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return
 
 

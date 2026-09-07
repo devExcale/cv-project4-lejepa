@@ -7,7 +7,15 @@ import torch.nn as nn
 
 from src.data import get_dataloaders
 from src.evaluation import evaluate_model, linear_probe, run_GMAR_pipeline, run_gradcam_pipeline
-from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, set_seed
+from src.globals import (
+    CONFIG,
+    DATASETS,
+    DEVICE,
+    get_best_checkpoint_path,
+    get_milestone_summary_path,
+    get_probe_path_for_checkpoint,
+    set_seed,
+)
 from src.network import LinearProbeModel, build_model
 from src.train import train_lejepa, train_supervised
 from src.utils import (
@@ -59,17 +67,11 @@ def parse_args():
 
 
 def _summary_path(args):
-    return os.path.join(
-        DIR_CHECKPOINTS,
-        f"{args.dataset}_{args.arch}_{args.paradigm}_milestones.json",
-    )
+    return get_milestone_summary_path(args.dataset, args.arch, args.paradigm)
 
 
 def _training_best_path(args):
-    return os.path.join(
-        DIR_CHECKPOINTS,
-        f"{args.dataset}_{args.arch}_{args.paradigm}_best.pt",
-    )
+    return get_best_checkpoint_path(args.dataset, args.arch, args.paradigm)
 
 
 def _load_summary(args):
@@ -84,10 +86,13 @@ def _load_summary(args):
 
 
 def _best_retained_checkpoint(summary):
+    best_path = summary.get("best_checkpoint_path")
+    if best_path and os.path.exists(best_path):
+        return best_path
     best_epoch = int(summary["best_epoch"])
     for path in summary["retained_checkpoints"]:
-        stem = os.path.splitext(path)[0]
-        if int(stem.rsplit("_", 1)[-1]) == best_epoch:
+        parent = os.path.basename(os.path.dirname(path))
+        if parent.startswith("epoch_") and int(parent.removeprefix("epoch_")) == best_epoch:
             return path
     raise FileNotFoundError(
         f"Retained checkpoint for best probe epoch {best_epoch} is missing."
@@ -108,6 +113,7 @@ def _select_milestones(args, device):
         t_max=args.sigreg_tmax,
         n_points=args.sigreg_points,
         lamb=args.lejepa_lambda,
+        resume=args.resume,
     )
 
 
@@ -142,12 +148,11 @@ def _ensure_linear_probe(
     probe_val,
     probe_test,
 ):
-    stored = checkpoint.get("linear_probe")
-    if stored and stored.get("head_state_dict") is not None:
-        return checkpoint
-
+    probe_path = get_probe_path_for_checkpoint(checkpoint_path)
     backbone = _probe_backbone(model, args.paradigm)
-    print(f"[Linear probe] No cached probe found for '{checkpoint_path}'. Training one probe now.")
+    backbone_epoch = int(checkpoint.get("epoch", -1))
+
+    print(f"[Linear probe] Ensuring probe for '{checkpoint_path}'.")
     result = linear_probe(
         backbone,
         probe_train,
@@ -157,22 +162,28 @@ def _ensure_linear_probe(
         device=device,
         epochs=args.probe_epochs,
         lr=args.probe_lr,
+        probe_checkpoint_path=probe_path,
+        resume=True,
+        metadata={
+            "dataset": args.dataset,
+            "arch": args.arch,
+            "paradigm": args.paradigm,
+            "backbone_epoch": backbone_epoch,
+            "backbone_checkpoint_path": checkpoint_path,
+        },
     )
-    checkpoint["linear_probe"] = {
-        "best_val_acc": float(result["best_val_acc"]),
-        "test_acc": float(result["test_acc"]),
-        "best_probe_epoch": int(result["best_epoch"]),
-        "head_state_dict": result["head_state_dict"],
-    }
-    torch.save(checkpoint, checkpoint_path)
-    print(f"[Linear probe] Cached probe results in '{checkpoint_path}'.")
-    return checkpoint
+    probe_checkpoint = torch.load(probe_path, map_location="cpu")
+    print(
+        f"[Linear probe] Probe available at '{probe_path}' | "
+        f"Val Acc {float(result['best_val_acc']):.2f}% | Test Acc {float(result['test_acc']):.2f}%"
+    )
+    return probe_checkpoint
 
 
-def _build_probe_classifier(model: nn.Module, checkpoint: dict, args, device: torch.device):
+def _build_probe_classifier(model: nn.Module, probe_checkpoint: dict, args, device: torch.device):
     backbone = _probe_backbone(model, args.paradigm)
     head = nn.Linear(backbone.embed_dim, DATASETS[args.dataset]["num_classes"])
-    head.load_state_dict(checkpoint["linear_probe"]["head_state_dict"])
+    head.load_state_dict(probe_checkpoint["head_state_dict"])
     return LinearProbeModel(backbone, head).to(device)
 
 
@@ -308,9 +319,11 @@ def main():
             include_test=True,
         )
         print(f"Best checkpoint selected by linear-probe validation accuracy: {checkpoint_path}")
-        if "linear_probe" in checkpoint:
-            print(f"Stored probe val accuracy:  {checkpoint['linear_probe']['best_val_acc']:.2f}%")
-            print(f"Stored probe test accuracy: {checkpoint['linear_probe']['test_acc']:.2f}%")
+        probe_path = get_probe_path_for_checkpoint(checkpoint_path)
+        if os.path.exists(probe_path):
+            probe_checkpoint = torch.load(probe_path, map_location="cpu")
+            print(f"Stored probe val accuracy:  {probe_checkpoint['best_val_acc']:.2f}%")
+            print(f"Stored probe test accuracy: {probe_checkpoint['test_acc']:.2f}%")
         print("Original supervised head test performance:")
         evaluate_model(model, test_loader, device, verbose=True)
         return
@@ -337,7 +350,7 @@ def main():
             val_fraction=args.val_fraction,
             include_test=True,
         )
-        checkpoint = _ensure_linear_probe(
+        probe_checkpoint = _ensure_linear_probe(
             checkpoint_path,
             checkpoint,
             model,
@@ -347,11 +360,11 @@ def main():
             probe_val,
             test_loader,
         )
-        probe_model = _build_probe_classifier(model, checkpoint, args, device)
+        probe_model = _build_probe_classifier(model, probe_checkpoint, args, device)
 
         print(f"Using {checkpoint_source}: {checkpoint_path}")
-        print(f"Linear-probe val accuracy:  {checkpoint['linear_probe']['best_val_acc']:.2f}%")
-        print(f"Linear-probe test accuracy: {checkpoint['linear_probe']['test_acc']:.2f}%")
+        print(f"Linear-probe val accuracy:  {probe_checkpoint['best_val_acc']:.2f}%")
+        print(f"Linear-probe test accuracy: {probe_checkpoint['test_acc']:.2f}%")
 
         if args.mode == "gradcam":
             run_gradcam_pipeline(

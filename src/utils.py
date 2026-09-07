@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import shutil
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -10,7 +11,18 @@ import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from src.data import get_dataloaders, get_or_compute_stats
-from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, DIR_OUTPUT, set_seed
+from src.globals import (
+	CONFIG,
+	DATASETS,
+	DEVICE,
+	DIR_OUTPUT,
+	get_best_checkpoint_path,
+	get_experiment_checkpoint_dir,
+	get_milestone_summary_path,
+	get_periodic_checkpoint_path,
+	get_probe_checkpoint_path,
+	set_seed,
+)
 from src.network import AttentionEncoder, build_model
 
 
@@ -258,16 +270,66 @@ MILESTONE_PCTS = [15, 30, 45, 60, 75, 90]
 
 
 def get_checkpoint_path(dataset: str, arch: str, paradigm: str, tag: str = "best") -> str:
-	return os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_{paradigm}_{tag}.pt")
+	"""Compatibility helper for callers that still ask for a checkpoint by tag."""
+	if tag == "best":
+		return get_best_checkpoint_path(dataset, arch, paradigm)
+	if tag.startswith("epoch_"):
+		tag = tag.removeprefix("epoch_")
+	try:
+		epoch = int(tag)
+	except ValueError as exc:
+		raise ValueError(f"Unrecognized checkpoint tag '{tag}'") from exc
+	return get_periodic_checkpoint_path(dataset, arch, paradigm, epoch)
 
 
 def list_periodic_checkpoints(dataset: str, arch: str, paradigm: str) -> List[str]:
-	pattern = os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_{paradigm}_epoch_*.pt")
-	return sorted(glob.glob(pattern))
+	root = get_experiment_checkpoint_dir(dataset, arch, paradigm)
+	pattern = os.path.join(root, "epoch_*", "checkpoint_*.pt")
+	return sorted(glob.glob(pattern), key=_epoch_from_checkpoint)
 
 
 def _epoch_from_checkpoint(path: str) -> int:
+	parent = os.path.basename(os.path.dirname(path))
+	if parent.startswith("epoch_"):
+		return int(parent.removeprefix("epoch_"))
+	# Fallback for legacy flat checkpoint names.
 	return int(os.path.splitext(path)[0].rsplit("_", 1)[-1])
+
+
+def _probe_record_from_result(epoch: int, checkpoint_path: str, probe_path: str, result: Dict) -> Dict:
+	return {
+		"epoch": int(epoch),
+		"path": checkpoint_path,
+		"probe_path": probe_path,
+		"val_acc": float(result["best_val_acc"]),
+		"test_acc": float(result["test_acc"]),
+		"test_loss": float(result["test_loss"]),
+		"probe_best_epoch": int(result["best_epoch"]),
+	}
+
+
+def _probe_payload_is_compatible(
+	payload: Dict,
+	dataset: str,
+	arch: str,
+	paradigm: str,
+	backbone_epoch: int,
+	probe_epochs: int,
+	probe_lr: float,
+) -> bool:
+	return (
+		payload.get("completed", False)
+		and payload.get("test_loss") is not None
+		and payload.get("test_acc") is not None
+		and int(payload.get("target_probe_epochs", -1)) == int(probe_epochs)
+		and int(payload.get("num_classes", -1)) == int(DATASETS[dataset]["num_classes"])
+		and float(payload.get("lr", float("nan"))) == float(probe_lr)
+		and float(payload.get("weight_decay", float("nan"))) == 0.0
+		and payload.get("dataset") == dataset
+		and payload.get("arch") == arch
+		and payload.get("paradigm") == paradigm
+		and int(payload.get("backbone_epoch", -1)) == int(backbone_epoch)
+	)
 
 
 def select_and_prune_milestones(
@@ -283,8 +345,9 @@ def select_and_prune_milestones(
 	t_max: float = CONFIG["sigreg_tmax"],
 	n_points: int = CONFIG["sigreg_points"],
 	lamb: float = CONFIG["lejepa_lambda"],
+	resume: bool = False,
 ) -> Dict:
-	"""Load all periodic checkpoints, probe them, select relative milestones, and prune the rest."""
+	"""Probe periodic checkpoints, select relative milestones, and prune unneeded epochs."""
 	from src.evaluation import linear_probe
 
 	paths = list_periodic_checkpoints(dataset, arch, paradigm)
@@ -303,9 +366,54 @@ def select_and_prune_milestones(
 		include_test=True,
 	)
 
+	if resume:
+		completed_epochs = []
+		for checkpoint_path in paths:
+			epoch = _epoch_from_checkpoint(checkpoint_path)
+			probe_path = get_probe_checkpoint_path(dataset, arch, paradigm, epoch=epoch)
+			if not os.path.exists(probe_path):
+				continue
+			try:
+				probe_payload = torch.load(probe_path, map_location="cpu")
+			except Exception:
+				continue
+			if _probe_payload_is_compatible(
+				probe_payload, dataset, arch, paradigm, epoch, probe_epochs, probe_lr
+			):
+				completed_epochs.append(epoch)
+		if completed_epochs:
+			print(
+				f"[Probe Resume] Last completed backbone probe is epoch {max(completed_epochs)}. "
+				"Compatible completed probes will be reused; a partial next probe will resume in-place."
+			)
+
 	records = []
 	for path in paths:
 		epoch = _epoch_from_checkpoint(path)
+		probe_path = get_probe_checkpoint_path(dataset, arch, paradigm, epoch=epoch)
+
+		if resume and os.path.exists(probe_path):
+			try:
+				probe_payload = torch.load(probe_path, map_location="cpu")
+			except Exception:
+				probe_payload = None
+			if probe_payload is not None and _probe_payload_is_compatible(
+				probe_payload, dataset, arch, paradigm, epoch, probe_epochs, probe_lr
+			):
+				print(
+					f"[Probe Resume] Reusing completed probe for backbone epoch {epoch}: {probe_path}"
+				)
+				records.append({
+					"epoch": int(epoch),
+					"path": path,
+					"probe_path": probe_path,
+					"val_acc": float(probe_payload["best_val_acc"]),
+					"test_acc": float(probe_payload["test_acc"]),
+					"test_loss": float(probe_payload["test_loss"]),
+					"probe_best_epoch": int(probe_payload["best_probe_epoch"]),
+				})
+				continue
+
 		model = build_model(
 			arch,
 			dataset,
@@ -318,7 +426,7 @@ def select_and_prune_milestones(
 		checkpoint = torch.load(path, map_location=device)
 		model.load_state_dict(checkpoint["model_state_dict"])
 
-		print(f"[Probe] Epoch {epoch}: {path}")
+		print(f"[Probe] Backbone epoch {epoch}: {path}")
 		result = linear_probe(
 			model,
 			probe_train,
@@ -328,16 +436,18 @@ def select_and_prune_milestones(
 			device=device,
 			epochs=probe_epochs,
 			lr=probe_lr,
+			probe_checkpoint_path=probe_path,
+			resume=resume,
+			metadata={
+				"dataset": dataset,
+				"arch": arch,
+				"paradigm": paradigm,
+				"backbone_epoch": int(epoch),
+				"backbone_checkpoint_path": path,
+			},
 		)
 
-		records.append({
-			"epoch": epoch,
-			"path": path,
-			"val_acc": float(result["best_val_acc"]),
-			"test_acc": float(result["test_acc"]),
-			"probe_best_epoch": int(result["best_epoch"]),
-			"head_state_dict": result["head_state_dict"],
-		})
+		records.append(_probe_record_from_result(epoch, path, probe_path, result))
 
 		del model
 		if torch.cuda.is_available():
@@ -361,6 +471,8 @@ def select_and_prune_milestones(
 			"epoch": chosen["epoch"],
 			"val_acc": chosen["val_acc"],
 			"test_acc": chosen["test_acc"],
+			"checkpoint_path": chosen["path"],
+			"probe_path": chosen["probe_path"],
 		}
 
 	# Several relative milestones may legitimately map to the same periodic checkpoint.
@@ -369,26 +481,30 @@ def select_and_prune_milestones(
 		labels_by_epoch.setdefault(info["epoch"], []).append(milestone)
 
 	# Retain every milestone checkpoint and the checkpoint with the best probe validation accuracy.
-	# The separate *_best.pt recovery checkpoint is not part of this pruning process.
+	# Probe files are colocated with their checkpoint and are pruned together with unneeded epochs.
 	keep_epochs = set(labels_by_epoch) | {best["epoch"]}
 	retained = []
+	retained_probes = []
 
 	for record in records:
+		epoch_dir = os.path.dirname(record["path"])
 		if record["epoch"] not in keep_epochs:
-			os.remove(record["path"])
+			shutil.rmtree(epoch_dir)
 			continue
 
 		checkpoint = torch.load(record["path"], map_location="cpu")
-		checkpoint["linear_probe"] = {
-			"best_val_acc": record["val_acc"],
-			"test_acc": record["test_acc"],
-			"best_probe_epoch": record["probe_best_epoch"],
-			"head_state_dict": record["head_state_dict"],
-		}
 		checkpoint["milestones"] = sorted(labels_by_epoch.get(record["epoch"], []))
 		checkpoint["is_best_probe_checkpoint"] = record["epoch"] == best["epoch"]
+		checkpoint["probe_path"] = record["probe_path"]
 		torch.save(checkpoint, record["path"])
+
+		probe = torch.load(record["probe_path"], map_location="cpu")
+		probe["milestones"] = sorted(labels_by_epoch.get(record["epoch"], []))
+		probe["is_best_probe_checkpoint"] = record["epoch"] == best["epoch"]
+		torch.save(probe, record["probe_path"])
+
 		retained.append(record["path"])
+		retained_probes.append(record["probe_path"])
 
 	summary = {
 		"dataset": dataset,
@@ -396,28 +512,30 @@ def select_and_prune_milestones(
 		"paradigm": paradigm,
 		"chance_accuracy": chance,
 		"accuracy_final": accuracy_final,
+		"last_probed_epoch": max(record["epoch"] for record in records),
 		"best_epoch": best["epoch"],
 		"best_val_acc": best["val_acc"],
 		"best_test_acc": best["test_acc"],
+		"best_checkpoint_path": best["path"],
+		"best_probe_path": best["probe_path"],
 		"model_config": {
 			"num_slices": num_slices,
 			"t_max": t_max,
 			"n_points": n_points,
 			"lamb": lamb,
 		},
+		"probe_config": {
+			"epochs": probe_epochs,
+			"lr": probe_lr,
+		},
 		"milestones": milestone_map,
 		"retained_checkpoints": retained,
-		"all_probe_results": [
-			{key: value for key, value in record.items() if key != "head_state_dict"}
-			for record in records
-		],
+		"retained_probes": retained_probes,
+		"all_probe_results": records,
 	}
 
-	summary_path = os.path.join(
-		DIR_CHECKPOINTS,
-		f"{dataset}_{arch}_{paradigm}_milestones.json",
-	)
-	with open(summary_path, "w") as file:
+	summary_path = get_milestone_summary_path(dataset, arch, paradigm)
+	with open(summary_path, "w", encoding="utf-8") as file:
 		json.dump(summary, file, indent=2)
 
 	print(f"[Milestones] Summary saved to {summary_path}")
@@ -546,7 +664,7 @@ def run_pca_for_checkpoint(
 	val_fraction: float = CONFIG["val_fraction"],
 	model_config: Dict | None = None,
 ):
-	"""Run PCA only on one explicitly chosen checkpoint (for example *_best.pt)."""
+	"""Run PCA only on one explicitly chosen checkpoint (for example best/checkpoint_best.pt)."""
 	if num_samples < 1:
 		return
 

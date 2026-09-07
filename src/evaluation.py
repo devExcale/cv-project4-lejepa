@@ -1,10 +1,12 @@
 import json
 import os
+from copy import deepcopy
 from typing import Tuple, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -309,6 +311,99 @@ def evaluate_linear_head(backbone, head, loader, device):
 	return running_loss / total, 100.0 * correct / total
 
 
+def _rebuild_probe_convergence_state(val_losses, convergence_cutoff):
+	"""Reconstruct early-stopping state from a probe's validation-loss history."""
+	best_loss = float("inf")
+	stalled_epochs = 0
+	for loss_value in val_losses:
+		loss_value = float(loss_value)
+		if best_loss - loss_value > convergence_cutoff:
+			best_loss = loss_value
+			stalled_epochs = 0
+		else:
+			stalled_epochs += 1
+	return best_loss, stalled_epochs
+
+
+def _save_linear_probe_state(
+	probe_checkpoint_path,
+	metadata,
+	current_epoch,
+	target_probe_epochs,
+	completed,
+	converged,
+	stop_reason,
+	convergence_cutoff,
+	convergence_patience,
+	best_convergence_val_loss,
+	epochs_without_substantial_improvement,
+	head,
+	best_head_state,
+	optimizer,
+	scheduler,
+	history,
+	num_classes,
+	lr,
+	weight_decay,
+	best_epoch,
+	best_val_acc,
+	test_loss=None,
+	test_acc=None,
+):
+	"""Persist the complete state required to inspect or resume a linear probe."""
+	if not probe_checkpoint_path:
+		return
+
+	directory = os.path.dirname(probe_checkpoint_path)
+	if directory:
+		os.makedirs(directory, exist_ok=True)
+
+	latest_train_loss = history["train_loss"][-1] if history["train_loss"] else None
+	latest_train_acc = history["train_acc"][-1] if history["train_acc"] else None
+	latest_val_loss = history["val_loss"][-1] if history["val_loss"] else None
+	latest_val_acc = history["val_acc"][-1] if history["val_acc"] else None
+	payload = {
+		"probe_type": "linear",
+		"probe_epoch": int(current_epoch),
+		"target_probe_epochs": int(target_probe_epochs),
+		"completed": bool(completed),
+		"converged": bool(converged),
+		"stop_reason": stop_reason,
+		"convergence_cutoff": float(convergence_cutoff),
+		"convergence_patience": int(convergence_patience),
+		"best_convergence_val_loss": (
+			None if best_convergence_val_loss == float("inf")
+			else float(best_convergence_val_loss)
+		),
+		"epochs_without_substantial_improvement": int(
+			epochs_without_substantial_improvement
+		),
+		"head_state_dict": {
+			key: value.detach().cpu()
+			for key, value in (best_head_state or head.state_dict()).items()
+		},
+		"last_head_state_dict": {
+			key: value.detach().cpu() for key, value in head.state_dict().items()
+		},
+		"optimizer_state_dict": optimizer.state_dict(),
+		"scheduler_state_dict": scheduler.state_dict(),
+		"history": history,
+		"num_classes": int(num_classes),
+		"lr": float(lr),
+		"weight_decay": float(weight_decay),
+		"train_loss": None if latest_train_loss is None else float(latest_train_loss),
+		"train_acc": None if latest_train_acc is None else float(latest_train_acc),
+		"val_loss": None if latest_val_loss is None else float(latest_val_loss),
+		"val_acc": None if latest_val_acc is None else float(latest_val_acc),
+		"best_probe_epoch": int(best_epoch),
+		"best_val_acc": float(best_val_acc),
+		"test_loss": None if test_loss is None else float(test_loss),
+		"test_acc": None if test_acc is None else float(test_acc),
+	}
+	payload.update(metadata)
+	torch.save(payload, probe_checkpoint_path)
+
+
 def linear_probe(
 	backbone,
 	train_loader,
@@ -316,16 +411,93 @@ def linear_probe(
 	test_loader,
 	num_classes,
 	device,
-	epochs=50,
-	lr=0.1,
+	epochs=CONFIG["probe_epochs"],
+	lr=CONFIG["probe_lr"],
 	weight_decay=0.0,
+	probe_checkpoint_path=None,
+	resume=False,
+	metadata=None,
+	convergence_cutoff=CONFIG["probe_convergence_cutoff"],
+	convergence_patience=CONFIG["probe_convergence_patience"],
 ):
-	"""Train an identical frozen-backbone linear probe for std and LeJEPA."""
-	from copy import deepcopy
-	import torch.optim as optim
+	"""Train, persist, and optionally resume a frozen-backbone linear probe.
+
+	Probe training stops when validation loss has not improved by more than
+	``convergence_cutoff`` for ``convergence_patience`` consecutive epochs.
+	``epochs`` remains the hard maximum number of probe-training epochs.
+	"""
+	if epochs < 1:
+		raise ValueError("epochs must be >= 1")
+	if convergence_cutoff < 0:
+		raise ValueError("convergence_cutoff must be >= 0")
+	if convergence_patience < 1:
+		raise ValueError("convergence_patience must be >= 1")
+
+	metadata = dict(metadata or {})
+	probe_checkpoint = None
+	candidate = None
+	if resume and probe_checkpoint_path and os.path.exists(probe_checkpoint_path):
+		try:
+			candidate = torch.load(probe_checkpoint_path, map_location="cpu")
+		except Exception as exc:
+			print(
+				f"[Linear Probe Resume] Could not load '{probe_checkpoint_path}' ({exc}). "
+				"Retraining that probe from scratch."
+			)
+			candidate = None
+
+	if resume and probe_checkpoint_path and candidate is not None:
+		compatible = (
+			int(candidate.get("num_classes", -1)) == int(num_classes)
+			and int(candidate.get("target_probe_epochs", -1)) == int(epochs)
+			and float(candidate.get("lr", float("nan"))) == float(lr)
+			and float(candidate.get("weight_decay", float("nan"))) == float(weight_decay)
+		)
+		# Probe checkpoints created before convergence stopping existed do not have
+		# these fields. They remain resumable and reconstruct the stopping state
+		# from their stored validation-loss history below.
+		if "convergence_cutoff" in candidate:
+			compatible = compatible and (
+				float(candidate["convergence_cutoff"]) == float(convergence_cutoff)
+			)
+		if "convergence_patience" in candidate:
+			compatible = compatible and (
+				int(candidate["convergence_patience"]) == int(convergence_patience)
+			)
+		for key in ("dataset", "arch", "paradigm", "backbone_epoch"):
+			if key in metadata and candidate.get(key) != metadata.get(key):
+				compatible = False
+				break
+
+		if compatible:
+			probe_checkpoint = candidate
+			if probe_checkpoint.get("completed", False):
+				print(
+					f"[Linear Probe Resume] Reusing completed probe from '{probe_checkpoint_path}' "
+					f"(best Val Acc {float(probe_checkpoint['best_val_acc']):.2f}%)."
+				)
+				return {
+					"best_epoch": int(probe_checkpoint["best_probe_epoch"]),
+					"best_val_acc": float(probe_checkpoint["best_val_acc"]),
+					"test_loss": float(probe_checkpoint["test_loss"]),
+					"test_acc": float(probe_checkpoint["test_acc"]),
+					"history": probe_checkpoint.get("history", {}),
+					"head_state_dict": probe_checkpoint["head_state_dict"],
+					"probe_checkpoint_path": probe_checkpoint_path,
+					"probe_epoch": int(probe_checkpoint.get("probe_epoch", epochs)),
+					"stop_reason": probe_checkpoint.get("stop_reason", "completed"),
+					"converged": bool(probe_checkpoint.get("converged", False)),
+				}
+		else:
+			print(
+				f"[Linear Probe Resume] Existing probe at '{probe_checkpoint_path}' is incompatible "
+				"with the requested configuration; retraining it from scratch."
+			)
+			probe_checkpoint = None
 
 	backbone = backbone.to(device)
 	backbone.eval()
+	original_requires_grad = [parameter.requires_grad for parameter in backbone.parameters()]
 	for parameter in backbone.parameters():
 		parameter.requires_grad_(False)
 
@@ -338,58 +510,179 @@ def linear_probe(
 	best_head_state = None
 	best_epoch = 0
 	history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+	start_epoch = 1
+	best_convergence_val_loss = float("inf")
+	epochs_without_substantial_improvement = 0
 
-	for epoch in range(1, epochs + 1):
-		head.train()
-		running_loss = 0.0
-		correct = total = 0
-		for images, labels in tqdm(train_loader, desc=f"Linear probe {epoch:03d}/{epochs:03d}", leave=False):
-			images = images.to(device, non_blocking=True)
-			labels = labels.to(device, non_blocking=True)
-			with torch.no_grad():
-				embeddings = backbone.forward_embedding(images)
-			optimizer.zero_grad()
-			logits = head(embeddings)
-			loss = criterion(logits, labels)
-			loss.backward()
-			optimizer.step()
-			running_loss += loss.item() * labels.size(0)
-			correct += logits.argmax(dim=1).eq(labels).sum().item()
-			total += labels.size(0)
+	if probe_checkpoint is not None:
+		last_state = probe_checkpoint.get("last_head_state_dict")
+		best_state = probe_checkpoint.get("head_state_dict")
+		if last_state is not None:
+			head.load_state_dict(last_state)
+		if probe_checkpoint.get("optimizer_state_dict") is not None:
+			optimizer.load_state_dict(probe_checkpoint["optimizer_state_dict"])
+		if probe_checkpoint.get("scheduler_state_dict") is not None:
+			scheduler.load_state_dict(probe_checkpoint["scheduler_state_dict"])
+		history = probe_checkpoint.get("history", history)
+		best_val_acc = float(probe_checkpoint.get("best_val_acc", best_val_acc))
+		best_epoch = int(probe_checkpoint.get("best_probe_epoch", 0))
+		best_head_state = deepcopy(best_state) if best_state is not None else None
+		start_epoch = int(probe_checkpoint.get("probe_epoch", 0)) + 1
 
-		train_loss = running_loss / total
-		train_acc = 100.0 * correct / total
-		val_loss, val_acc = evaluate_linear_head(backbone, head, val_loader, device)
-		scheduler.step()
-		history["train_loss"].append(train_loss)
-		history["train_acc"].append(train_acc)
-		history["val_loss"].append(val_loss)
-		history["val_acc"].append(val_acc)
+		if probe_checkpoint.get("best_convergence_val_loss") is not None:
+			best_convergence_val_loss = float(probe_checkpoint["best_convergence_val_loss"])
+			epochs_without_substantial_improvement = int(
+				probe_checkpoint.get("epochs_without_substantial_improvement", 0)
+			)
+		else:
+			best_convergence_val_loss, epochs_without_substantial_improvement = (
+				_rebuild_probe_convergence_state(
+					history.get("val_loss", []),
+					convergence_cutoff,
+				)
+			)
 
 		print(
-			f"Linear probe {epoch:03d}/{epochs:03d} | "
-			f"Train Loss {train_loss:.4f} | Train Acc {train_acc:.2f}% | "
-			f"Val Loss {val_loss:.4f} | Val Acc {val_acc:.2f}%"
+			f"[Linear Probe Resume] Resuming '{probe_checkpoint_path}' at probe epoch "
+			f"{start_epoch}/{epochs} | convergence patience "
+			f"{epochs_without_substantial_improvement}/{convergence_patience}."
 		)
 
-		if val_acc > best_val_acc:
-			best_val_acc = val_acc
-			best_epoch = epoch
-			best_head_state = deepcopy(head.state_dict())
+	try:
+		stopped_epoch = min(max(start_epoch - 1, 0), epochs)
+		converged = epochs_without_substantial_improvement >= convergence_patience
 
-	head.load_state_dict(best_head_state)
-	test_loss, test_acc = evaluate_linear_head(backbone, head, test_loader, device)
-	print(
-		f"[Linear Probe Complete] Best epoch {best_epoch:03d} | "
-		f"Best Val Acc {best_val_acc:.2f}% | Test Acc {test_acc:.2f}%"
-	)
-	for parameter in backbone.parameters():
-		parameter.requires_grad_(True)
-	return {
-		"best_epoch": best_epoch,
-		"best_val_acc": best_val_acc,
-		"test_loss": test_loss,
-		"test_acc": test_acc,
-		"history": history,
-		"head_state_dict": {k: v.cpu() for k, v in best_head_state.items()},
-	}
+		for epoch in range(start_epoch, epochs + 1):
+			if converged:
+				break
+
+			head.train()
+			running_loss = 0.0
+			correct = total = 0
+			for images, labels in tqdm(train_loader, desc=f"Linear probe {epoch:03d}/{epochs:03d}", leave=False):
+				images = images.to(device, non_blocking=True)
+				labels = labels.to(device, non_blocking=True)
+				with torch.no_grad():
+					embeddings = backbone.forward_embedding(images)
+				optimizer.zero_grad()
+				logits = head(embeddings)
+				loss = criterion(logits, labels)
+				loss.backward()
+				optimizer.step()
+				running_loss += loss.item() * labels.size(0)
+				correct += logits.argmax(dim=1).eq(labels).sum().item()
+				total += labels.size(0)
+
+			train_loss = running_loss / total
+			train_acc = 100.0 * correct / total
+			val_loss, val_acc = evaluate_linear_head(backbone, head, val_loader, device)
+			scheduler.step()
+			history["train_loss"].append(train_loss)
+			history["train_acc"].append(train_acc)
+			history["val_loss"].append(val_loss)
+			history["val_acc"].append(val_acc)
+
+			print(
+				f"Linear probe {epoch:03d}/{epochs:03d} | "
+				f"Train Loss {train_loss:.4f} | Train Acc {train_acc:.2f}% | "
+				f"Val Loss {val_loss:.4f} | Val Acc {val_acc:.2f}%"
+			)
+
+			if val_acc > best_val_acc:
+				best_val_acc = val_acc
+				best_epoch = epoch
+				best_head_state = deepcopy(head.state_dict())
+
+			loss_improvement = best_convergence_val_loss - val_loss
+			if loss_improvement > convergence_cutoff:
+				best_convergence_val_loss = val_loss
+				epochs_without_substantial_improvement = 0
+			else:
+				epochs_without_substantial_improvement += 1
+
+			stopped_epoch = epoch
+			converged = epochs_without_substantial_improvement >= convergence_patience
+			_save_linear_probe_state(
+				probe_checkpoint_path=probe_checkpoint_path,
+				metadata=metadata,
+				current_epoch=epoch,
+				target_probe_epochs=epochs,
+				completed=False,
+				converged=converged,
+				stop_reason=None,
+				convergence_cutoff=convergence_cutoff,
+				convergence_patience=convergence_patience,
+				best_convergence_val_loss=best_convergence_val_loss,
+				epochs_without_substantial_improvement=epochs_without_substantial_improvement,
+				head=head,
+				best_head_state=best_head_state,
+				optimizer=optimizer,
+				scheduler=scheduler,
+				history=history,
+				num_classes=num_classes,
+				lr=lr,
+				weight_decay=weight_decay,
+				best_epoch=best_epoch,
+				best_val_acc=best_val_acc,
+			)
+
+			if converged:
+				print(
+					f"[Linear Probe Converged] Validation loss did not improve by more than "
+					f"{convergence_cutoff:g} for {convergence_patience} consecutive epochs. "
+					f"Stopping at probe epoch {epoch:03d}/{epochs:03d}."
+				)
+				break
+
+		if best_head_state is None:
+			raise RuntimeError("Linear probe has no best head state to evaluate")
+
+		head.load_state_dict(best_head_state)
+		test_loss, test_acc = evaluate_linear_head(backbone, head, test_loader, device)
+		stop_reason = "converged" if converged else "max_epochs"
+		_save_linear_probe_state(
+			probe_checkpoint_path=probe_checkpoint_path,
+			metadata=metadata,
+			current_epoch=stopped_epoch,
+			target_probe_epochs=epochs,
+			completed=True,
+			converged=converged,
+			stop_reason=stop_reason,
+			convergence_cutoff=convergence_cutoff,
+			convergence_patience=convergence_patience,
+			best_convergence_val_loss=best_convergence_val_loss,
+			epochs_without_substantial_improvement=epochs_without_substantial_improvement,
+			head=head,
+			best_head_state=best_head_state,
+			optimizer=optimizer,
+			scheduler=scheduler,
+			history=history,
+			num_classes=num_classes,
+			lr=lr,
+			weight_decay=weight_decay,
+			best_epoch=best_epoch,
+			best_val_acc=best_val_acc,
+			test_loss=test_loss,
+			test_acc=test_acc,
+		)
+		print(
+			f"[Linear Probe Complete] Best epoch {best_epoch:03d} | "
+			f"Best Val Acc {best_val_acc:.2f}% | Test Acc {test_acc:.2f}% | "
+			f"Stopped at {stopped_epoch:03d}/{epochs:03d} ({stop_reason})"
+		)
+		return {
+			"best_epoch": best_epoch,
+			"best_val_acc": best_val_acc,
+			"test_loss": test_loss,
+			"test_acc": test_acc,
+			"history": history,
+			"head_state_dict": {k: v.cpu() for k, v in best_head_state.items()},
+			"probe_checkpoint_path": probe_checkpoint_path,
+			"probe_epoch": stopped_epoch,
+			"stop_reason": stop_reason,
+			"converged": converged,
+		}
+	finally:
+		for parameter, requires_grad in zip(backbone.parameters(), original_requires_grad):
+			parameter.requires_grad_(requires_grad)
+

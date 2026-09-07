@@ -9,15 +9,7 @@ from src.evaluation import evaluate_model, run_GMAR_pipeline, run_gradcam_pipeli
 from src.globals import CONFIG, DATASETS, DEVICE, set_seed
 from src.network import LinearProbeModel, build_model
 from src.train import train_lejepa, train_supervised
-from src.utils import (
-    build_relative_accuracy_comparison,
-    load_probe_summary,
-    probe_all_checkpoints,
-    run_pca_for_all_checkpoints,
-    test_config,
-    test_cuda,
-    test_pipeline,
-)
+from src.utils import build_relative_accuracy_comparison, load_probe_summary, probe_all_checkpoints, run_pca_for_all_checkpoints, test_config, test_cuda, test_pipeline
 
 
 def parse_args():

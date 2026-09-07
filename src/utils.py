@@ -159,6 +159,14 @@ class GMAR:
 			module for module in self.model.modules()
 			if isinstance(module, AttentionEncoder)
 		]
+		# if not found, try inside the backbone (for LinearProbeModel or similar wrappers)
+		if not self.attn_modules and hasattr(self.model, "backbone"):
+			print("[GMAR] No AttentionEncoder modules found in the model; checking the backbone...")
+			self.attn_modules = [
+				module for module in self.model.backbone.modules()
+				if isinstance(module, AttentionEncoder)
+			]
+		print(f"[GMAR] Found {len(self.attn_modules)} AttentionEncoder modules in the model")
 		if not self.attn_modules:
 			raise ValueError("GMAR requires a model containing AttentionEncoder modules")
 
@@ -252,6 +260,102 @@ class GMAR:
 		saliency_map = (saliency_map - minimum) / (maximum - minimum).clamp_min(1e-8)
 		self.model.zero_grad()
 		return saliency_map.detach()
+
+
+
+class SAS:
+	'''Semantic Alignment Score'''
+	def __init__(self):
+		pass
+	def compute_sas(self, XAI_sal_map: torch.Tensor, PCA_sem_map: torch.Tensor) -> float:
+		"""
+		Compute the Semantic Alignment Score (SAS) between XAI saliency maps and PCA semantic maps.
+		Args:
+			XAI_sal_map (torch.Tensor): Saliency map from XAI method, shape [B, H, W].
+			PCA_sem_map (torch.Tensor): Semantic map from PCA, shape [B, H, W].
+
+		Returns:
+			float: The computed SAS.
+		"""
+		# Flatten the tensors
+		XAI_flat = XAI_sal_map.flatten(1)
+		PCA_flat = PCA_sem_map.flatten(1)
+
+		# Compute the correlation
+		corr = torch.corrcoef(torch.stack([XAI_flat, PCA_flat]))[0, 1]
+
+		return corr.item()
+	def jaccard_index(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> float:
+		'''Compute the Jaccard Index between XAI saliency maps and PCA semantic maps.'''
+	
+
+		# Compute the Jaccard Index
+		intersection = torch.sum(XAI_flat * PCA_flat)
+		union = torch.sum(XAI_flat) + torch.sum(PCA_flat) - intersection
+
+		return (intersection / union).item()
+	def MSE(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> float:
+		'''Compute the Mean Squared Error (MSE) between XAI saliency maps and PCA semantic maps.'''
+		# Compute the Mean Squared Error
+		return torch.mean((XAI_flat - PCA_flat) ** 2).item()
+	def MAE(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> float:
+		'''Compute the Mean Absolute Error (MAE) between XAI saliency maps and PCA semantic maps.'''
+		# Compute the Mean Absolute Error
+		return torch.mean(torch.abs(XAI_flat - PCA_flat)).item()
+	def spearman_correlation(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> float:
+		'''Compute the Spearman's rank correlation coefficient between XAI saliency maps and PCA semantic maps.'''
+		# Compute ranks
+		XAI_rank = torch.argsort(torch.argsort(XAI_flat))
+		PCA_rank = torch.argsort(torch.argsort(PCA_flat))
+		# Compute Spearman's rank correlation coefficient
+		n = XAI_flat.numel()
+		d = XAI_rank - PCA_rank
+		spearman_corr = 1 - (6 * torch.sum(d ** 2)) / (n * (n ** 2 - 1))
+
+		return spearman_corr.item()
+	def pearson_correlation(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> float:
+		'''Compute the Pearson correlation coefficient between XAI saliency maps and PCA semantic maps.'''
+		# Compute means
+		XAI_mean = torch.mean(XAI_flat)
+		PCA_mean = torch.mean(PCA_flat)
+		# Compute covariance and standard deviations
+		covariance = torch.mean((XAI_flat - XAI_mean) * (PCA_flat - PCA_mean))
+		XAI_std = torch.std(XAI_flat)
+		PCA_std = torch.std(PCA_flat)
+		# Compute Pearson correlation coefficient
+		pearson_corr = covariance / (XAI_std * PCA_std)
+
+		return pearson_corr.item()
+	def mutual_information(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor, num_bins: int = 20) -> float:
+		'''Compute the Mutual Information (MI) between XAI saliency maps and PCA semantic maps.'''
+		# Compute joint histogram
+		joint_hist = torch.histc(XAI_flat * num_bins + PCA_flat, bins=num_bins**2, min=0, max=num_bins**2 - 1)
+		joint_prob = joint_hist / torch.sum(joint_hist)
+		joint_prob = joint_prob[joint_prob > 0]  # Remove zero probabilities
+
+		# Compute marginal probabilities
+		XAI_hist = torch.histc(XAI_flat, bins=num_bins, min=0, max=num_bins - 1)
+		PCA_hist = torch.histc(PCA_flat, bins=num_bins, min=0, max=num_bins - 1)
+		XAI_prob = XAI_hist / torch.sum(XAI_hist)
+		PCA_prob = PCA_hist / torch.sum(PCA_hist)
+
+		XAI_prob = XAI_prob[XAI_prob > 0]
+		PCA_prob = PCA_prob[PCA_prob > 0]
+
+		# Compute Mutual Information
+		mi = torch.sum(joint_prob * torch.log(joint_prob / (XAI_prob.unsqueeze(1) * PCA_prob.unsqueeze(0)).clamp_min(1e-8)))
+
+		return mi.item()
+	def sq_sum_ratio(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> float:
+		'''My invented metric'''
+		nXAI, nPCA = (XAI_flat - torch.mean(XAI_flat)) / torch.std(XAI_flat), (PCA_flat - torch.mean(PCA_flat)) / torch.std(PCA_flat)
+		squared_diff = (nXAI - nPCA) ** 2
+		squared_sum = (nXAI + nPCA) ** 2
+		sq_ratio = torch.sum(squared_sum / (squared_diff + 1e-8)) # if equal --> inf, if opposite --> 0
+		sq_sum = torch.sum(squared_sum - squared_diff) # if equal
+
+		return 
+
 
 
 MILESTONE_PCTS = [15, 30, 45, 60, 75, 90]

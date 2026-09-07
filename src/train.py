@@ -22,16 +22,14 @@ def get_lr_for_epoch(epoch: int, epochs: int, base_lr: float, warmup_epochs: int
 	return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def _periodic_checkpoint_path(dataset_name, arch, paradigm, epoch):
-	return os.path.join(DIR_CHECKPOINTS, f"{dataset_name}_{arch}_{paradigm}_epoch_{epoch:04d}.pt")
-
-
-def _best_checkpoint_path(dataset_name, arch, paradigm):
-	return os.path.join(DIR_CHECKPOINTS, f"{dataset_name}_{arch}_{paradigm}_best.pt")
-
-
 def _save_periodic_checkpoint(epoch, model, optimizer, history, dataset_name, arch, paradigm, scheduler=None, extra=None):
-	path = _periodic_checkpoint_path(dataset_name, arch, paradigm, epoch)
+	directory = os.path.join(
+		DIR_CHECKPOINTS,
+		f"{dataset_name}_{arch}_{paradigm}",
+		f"epoch_{int(epoch):04d}",
+	)
+	os.makedirs(directory, exist_ok=True)
+	path = os.path.join(directory, f"checkpoint_{int(epoch):04d}.pt")
 	payload = {
 		"epoch": epoch,
 		"model_state_dict": model.state_dict(),
@@ -109,11 +107,13 @@ def train_supervised(
 	criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 	history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 	best_val_acc = float("-inf")
-	best_path = _best_checkpoint_path(dataset_name, arch, paradigm)
+	best_dir = os.path.join(DIR_CHECKPOINTS, f"{dataset_name}_{arch}_{paradigm}", "best")
+	os.makedirs(best_dir, exist_ok=True)
+	best_path = os.path.join(best_dir, "checkpoint_best.pt")
 	start_epoch = 1
 
 	# The recovery checkpoint is intentionally independent of the periodic
-	# checkpoints used later for linear-probe milestone selection.
+	# checkpoints used later for trajectory-wide linear probing.
 	if resume:
 		if os.path.exists(best_path):
 			checkpoint = torch.load(best_path, map_location=device)
@@ -240,7 +240,9 @@ def train_lejepa(
 	optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 	history = {"loss": [], "invariance": [], "sigreg": []}
 	best_loss = float("inf")
-	best_path = _best_checkpoint_path(dataset_name, arch, "lejepa")
+	best_dir = os.path.join(DIR_CHECKPOINTS, f"{dataset_name}_{arch}_lejepa", "best")
+	os.makedirs(best_dir, exist_ok=True)
+	best_path = os.path.join(best_dir, "checkpoint_best.pt")
 	start_epoch = 1
 
 	if resume:

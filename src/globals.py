@@ -12,6 +12,79 @@ DIR_CHECKPOINTS = os.path.join(DIR_PROJECT, "checkpoints")
 DIR_OUTPUT = os.path.join(DIR_PROJECT, "output")
 PATH_DATASET_STATS = os.path.join(DIR_DATA, "dataset_stats.json")
 
+
+def get_experiment_checkpoint_dir(dataset: str, arch: str, paradigm: str) -> str:
+	"""Return the root directory for one dataset/architecture/paradigm run."""
+	path = os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_{paradigm}")
+	os.makedirs(path, exist_ok=True)
+	return path
+
+
+def get_epoch_checkpoint_dir(dataset: str, arch: str, paradigm: str, epoch: int) -> str:
+	"""Return/create the directory holding one epoch checkpoint and its probe."""
+	path = os.path.join(
+		get_experiment_checkpoint_dir(dataset, arch, paradigm),
+		f"epoch_{int(epoch):04d}",
+	)
+	os.makedirs(path, exist_ok=True)
+	return path
+
+
+def get_periodic_checkpoint_path(dataset: str, arch: str, paradigm: str, epoch: int) -> str:
+	return os.path.join(
+		get_epoch_checkpoint_dir(dataset, arch, paradigm, epoch),
+		f"checkpoint_{int(epoch):04d}.pt",
+	)
+
+
+def get_best_checkpoint_dir(dataset: str, arch: str, paradigm: str) -> str:
+	path = os.path.join(get_experiment_checkpoint_dir(dataset, arch, paradigm), "best")
+	os.makedirs(path, exist_ok=True)
+	return path
+
+
+def get_best_checkpoint_path(dataset: str, arch: str, paradigm: str) -> str:
+	return os.path.join(get_best_checkpoint_dir(dataset, arch, paradigm), "checkpoint_best.pt")
+
+
+def get_probe_checkpoint_path(
+	dataset: str,
+	arch: str,
+	paradigm: str,
+	epoch: int | None = None,
+	best: bool = False,
+) -> str:
+	if best:
+		return os.path.join(get_best_checkpoint_dir(dataset, arch, paradigm), "probe_best.pt")
+	if epoch is None:
+		raise ValueError("epoch is required when best=False")
+	return os.path.join(
+		get_epoch_checkpoint_dir(dataset, arch, paradigm, epoch),
+		f"probe_{int(epoch):04d}.pt",
+	)
+
+
+def get_probe_path_for_checkpoint(checkpoint_path: str) -> str:
+	"""Map a checkpoint in the new layout to the colocated probe path."""
+	parent = os.path.dirname(checkpoint_path)
+	dir_name = os.path.basename(parent)
+	if dir_name == "best":
+		return os.path.join(parent, "probe_best.pt")
+	if dir_name.startswith("epoch_"):
+		epoch_tag = dir_name.removeprefix("epoch_")
+		return os.path.join(parent, f"probe_{epoch_tag}.pt")
+	raise ValueError(f"Checkpoint path is not in the expected layout: '{checkpoint_path}'")
+
+
+def get_probe_summary_path(dataset: str, arch: str, paradigm: str) -> str:
+	"""Return the summary path containing results for every periodic backbone probe."""
+	return os.path.join(get_experiment_checkpoint_dir(dataset, arch, paradigm), "probe_results.json")
+
+
+def get_relative_comparison_path(dataset: str, arch: str) -> str:
+	"""Return the cross-paradigm relative-accuracy comparison summary path."""
+	return os.path.join(DIR_CHECKPOINTS, f"{dataset}_{arch}_relative_accuracy_comparison.json")
+
 # Ensure required directories exist on launch
 for dir_path in [DIR_DATA, DIR_CHECKPOINTS, DIR_OUTPUT]:
 	os.makedirs(dir_path, exist_ok=True)
@@ -50,6 +123,8 @@ CONFIG = {
     "checkpoint_interval": 10,
 	"probe_epochs": 50,
 	"probe_lr": 0.1,
+	"probe_convergence_cutoff": 1e-3,
+	"probe_convergence_patience": 5,
 	"pca_samples": 8,
 	"sigreg_slices": 1024,
 	"sigreg_tmax": 3.0,

@@ -291,6 +291,7 @@ def main():
                     val_fraction=args.val_fraction,
                     output_name=output_name,
                     plot=args.plot,
+                    resume=args.resume,
                 )
             else:
                 run_GMAR_pipeline(

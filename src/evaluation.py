@@ -110,6 +110,7 @@ def run_gradcam_pipeline(
 		val_fraction: float = CONFIG["val_fraction"],
 		output_name: str | None = None,
 		plot: bool = True,
+		resume: bool = True,
 ) -> str:
 	"""
 	Extract Grad-CAM maps across all 4 stages for all samples in the loader.
@@ -142,47 +143,66 @@ def run_gradcam_pipeline(
 	if not plot:
 		class_counters: dict[int, int] = {}
 		total_saved = 0
+		total_skipped = 0
 
 		for images, labels in loader:
-			inputs = images.to(device)
-			targets = labels.to(device)
+			batch_size = images.size(0)
+			needed_indices = []
+			sample_filepaths = []
 
-			# Extract [B, 32, 32] heatmap tensors per stage
-			batch_cams: list[torch.Tensor] = []
-			for target_layer in target_layers:
-				grad_cam = GradCAM(model=model, target_layer=target_layer)
-				try:
-					# generate_cam returns a Tensor of shape [B, H, W] in [0, 1]
-					cams = grad_cam.generate_cam(inputs, target_class=targets)
-					batch_cams.append(cams)
-				finally:
-					grad_cam.remove_hooks()
-
-			# Stack along the final dimension: [B, 32, 32, 4]
-			stacked_cams = torch.stack(batch_cams, dim=-1)
-
-			batch_size = inputs.size(0)
+			# Resolve filenames and check disk cache deterministically
 			for b in range(batch_size):
 				true_label = int(labels[b])
 				point_idx = class_counters.get(true_label, 0)
 				ds_point = f"c{true_label}_{point_idx}"
-
 				filename = f"{output_stem}_{ds_point}.pt"
 				filepath = os.path.join(output_dir, filename)
 
-				# Save the [32, 32, 4] tensor directly
-				torch.save(stacked_cams[b], filepath)
-
+				sample_filepaths.append(filepath)
 				class_counters[true_label] = point_idx + 1
+
+				if resume and os.path.exists(filepath):
+					total_skipped += 1
+				else:
+					needed_indices.append(b)
+
+			# If all samples in this batch already exist, skip computation
+			if not needed_indices:
+				continue
+
+			# Slice batch to compute Grad-CAM for missing samples
+			sub_inputs = images[needed_indices].to(device)
+			sub_targets = labels[needed_indices].to(device)
+
+			batch_cams: list[torch.Tensor] = []
+			for target_layer in target_layers:
+				grad_cam = GradCAM(model=model, target_layer=target_layer)
+				try:
+					cams = grad_cam.generate_cam(sub_inputs, target_class=sub_targets)
+					batch_cams.append(cams)
+				finally:
+					grad_cam.remove_hooks()
+
+			# Stack along final axis: [len(needed_indices), 32, 32, 4]
+			stacked_cams = torch.stack(batch_cams, dim=-1)
+
+			# Save only the newly computed heatmaps
+			for idx, b in enumerate(needed_indices):
+				torch.save(stacked_cams[idx], sample_filepaths[b])
 				total_saved += 1
 
 		print(
-			f"[Grad-CAM Complete] Saved {total_saved} tensor heatmaps of shape [32, 32, 4] "
-			f"to: {output_dir}"
+			f"[Grad-CAM] Directory: {output_dir} | "
+			f"Saved: {total_saved} new | Skipped: {total_skipped} existing"
 		)
 		return output_dir
 
 	# --- Preview plot (gradcam heatmaps + guided backprop) ---
+	output_filepath = os.path.join(output_dir, f"{output_stem}.pdf")
+	if resume and os.path.exists(output_filepath):
+		print(f"[Grad-CAM Resume] Visualizations already exist at: {output_filepath}. Skipping.")
+		return output_filepath
+
 	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
 	mean_array = np.array(mean).reshape(1, 3, 1, 1)
 	std_array = np.array(std).reshape(1, 3, 1, 1)
@@ -256,7 +276,6 @@ def run_gradcam_pipeline(
 			axes[i, col_guided].set_title(f"{stage_name}\nGuided CAM", fontsize=9)
 			axes[i, col_guided].axis("off")
 
-	output_filepath = os.path.join(output_dir, f"{output_stem}.pdf")
 	plt.tight_layout()
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close(fig)

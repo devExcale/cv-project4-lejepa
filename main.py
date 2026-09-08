@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument("-r", "--resume", action="store_true")
     parser.add_argument("--skip_postprocess", action="store_true")
     parser.add_argument("--eval-class-samples", type=int, default=1)
-    parser.add_argument("--plot", action="store_true", help="Enable plotting for Grad-CAM or GMAR visualizations")
+    parser.add_argument("--plot", action="store_true", help="Enable plotting for PCA, Grad-CAM, or GMAR visualizations")
     return parser.parse_args()
 
 
@@ -180,6 +180,7 @@ def main():
             device,
             args.pca_samples,
             val_fraction=args.val_fraction,
+            plot=args.plot,
         )
         return
 

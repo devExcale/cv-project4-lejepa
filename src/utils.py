@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.utils import save_image
+from matplotlib import pyplot as plt
 
 from src.data import get_dataloaders, get_or_compute_stats
 from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, DIR_OUTPUT, set_seed
@@ -679,6 +679,35 @@ def denormalize(
 	return (images.cpu() * std_tensor + mean_tensor).clamp(0, 1)
 
 
+def _get_spatial_feature_maps(model: nn.Module, images: torch.Tensor) -> tuple[torch.Tensor, ...]:
+	"""Normalize CNN/ViT ``forward_features`` outputs to spatial [B, C, H, W] maps."""
+	features = model.forward_features(images)
+
+	# ViT returns (tuple(spatial_maps), tuple(class_tokens)).
+	if (
+		isinstance(features, tuple)
+		and len(features) == 2
+		and isinstance(features[0], (tuple, list))
+	):
+		features = features[0]
+
+	if isinstance(features, torch.Tensor):
+		features = (features,)
+
+	if not isinstance(features, (tuple, list)) or not features:
+		raise ValueError("forward_features() did not return any spatial feature maps")
+
+	spatial_maps = tuple(features)
+	for layer_index, feature_map in enumerate(spatial_maps):
+		if not isinstance(feature_map, torch.Tensor) or feature_map.ndim != 4:
+			raise ValueError(
+				f"PCA requires spatial [B, C, H, W] feature maps; layer {layer_index} "
+				f"returned {type(feature_map).__name__} with shape "
+				f"{getattr(feature_map, 'shape', None)}"
+			)
+	return spatial_maps
+
+
 def _run_pca_checkpoint(
 	checkpoint_path: str,
 	dataset: str,
@@ -691,7 +720,9 @@ def _run_pca_checkpoint(
 	model_config: Dict,
 	output_name: str,
 	probe_record: Dict | None = None,
+	plot: bool = False,
 ):
+	"""Run spatial PCA for one checkpoint, saving tensors or a visual preview."""
 	from src.evaluation import pca_outputs
 
 	checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -716,10 +747,14 @@ def _run_pca_checkpoint(
 		f"{arch}_{paradigm}",
 		output_name,
 	)
+	os.makedirs(output_root, exist_ok=True)
 
 	saved = 0
 	sample_index = 0
 	num_layers = None
+	plot_originals: list[torch.Tensor] = []
+	plot_labels: list[int] = []
+	plot_rgb_by_sample: list[list[torch.Tensor]] = []
 
 	with torch.no_grad():
 		for images, labels in test_loader:
@@ -729,13 +764,20 @@ def _run_pca_checkpoint(
 
 			images = images[:remaining]
 			labels = labels[:remaining]
-			features = model.forward_features(images.to(device, non_blocking=True))
+			features = _get_spatial_feature_maps(model, images.to(device, non_blocking=True))
 			originals = denormalize(images, dataset, val_fraction=val_fraction)
 			num_layers = len(features)
 
 			for batch_index in range(images.size(0)):
+				sample_rgb: list[torch.Tensor] = []
+
 				for layer_index, feature_map in enumerate(features):
 					result = pca_outputs(feature_map, image_index=batch_index)
+
+					if plot:
+						sample_rgb.append(result["rgb"])
+						continue
+
 					result_dir = os.path.join(
 						output_root,
 						f"layer_{layer_index:02d}",
@@ -766,21 +808,56 @@ def _run_pca_checkpoint(
 						"rgb": result["rgb"],
 						"metadata": metadata,
 					}
-
 					torch.save(payload, os.path.join(result_dir, "pca.pt"))
-					save_image(originals[batch_index], os.path.join(result_dir, "original.png"))
-					save_image(result["rgb"].permute(2, 0, 1), os.path.join(result_dir, "pca_rgb.png"))
-					save_image(result["mask"].float().unsqueeze(0), os.path.join(result_dir, "pca_mask.png"))
-					with open(os.path.join(result_dir, "metadata.json"), "w", encoding="utf-8") as file:
-						json.dump(metadata, file, indent=2)
+
+				if plot:
+					plot_originals.append(originals[batch_index])
+					plot_labels.append(int(labels[batch_index]))
+					plot_rgb_by_sample.append(sample_rgb)
 
 				sample_index += 1
 				saved += 1
 
-	print(
-		f"[PCA] Epoch {epoch}: saved {saved} test samples "
-		f"across {num_layers} feature layers to '{output_root}'."
+	if saved == 0 or num_layers is None:
+		raise ValueError("The provided test DataLoader is empty.")
+
+	if not plot:
+		print(
+			f"[PCA] Epoch {epoch}: saved tensors for {saved} test samples "
+			f"across {num_layers} feature layers to '{output_root}'."
+		)
+		return output_root
+
+	# PCA does not reconstruct the input image. The first three PCA score maps are
+	# normalized independently and displayed as pseudo-RGB channels (PC1/PC2/PC3).
+	fig, axes = plt.subplots(
+		saved,
+		1 + num_layers,
+		figsize=(2.8 * (1 + num_layers), 2.8 * saved),
+		squeeze=False,
 	)
+	layer_word = "Block" if arch == "vit" else "Stage"
+
+	for row in range(saved):
+		original = plot_originals[row].permute(1, 2, 0).numpy()
+		axes[row, 0].imshow(original)
+		axes[row, 0].set_title(f"Sample {row + 1}\nLabel {plot_labels[row]}", fontsize=9)
+		axes[row, 0].axis("off")
+
+		for layer_index, rgb in enumerate(plot_rgb_by_sample[row]):
+			axes[row, layer_index + 1].imshow(rgb.numpy())
+			axes[row, layer_index + 1].set_title(
+				f"{layer_word} {layer_index + 1}\nPCA RGB (PC1/2/3)",
+				fontsize=9,
+			)
+			axes[row, layer_index + 1].axis("off")
+
+	plt.tight_layout()
+	output_filepath = os.path.join(output_root, "pca_preview.png")
+	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
+	plt.close(fig)
+	print(f"[PCA Complete] Visualization saved to: {output_filepath}")
+	return output_filepath
 
 
 def run_pca_for_all_checkpoints(
@@ -789,10 +866,11 @@ def run_pca_for_all_checkpoints(
 	device: torch.device,
 	num_samples: int,
 	val_fraction: float = CONFIG["val_fraction"],
+	plot: bool = False,
 ):
 	"""Run PCA on every backbone checkpoint represented in the probe summary."""
 	if num_samples < 1:
-		return
+		return []
 
 	dataset = summary["dataset"]
 	arch = summary["arch"]
@@ -807,11 +885,12 @@ def run_pca_for_all_checkpoints(
 		include_test=True,
 	)
 
+	outputs = []
 	for record in summary["probe_results"]:
 		epoch = int(record["epoch"])
 		relative = record.get("relative_accuracy")
 		relative_tag = "na" if relative is None else f"{float(relative):06.2f}"
-		_run_pca_checkpoint(
+		outputs.append(_run_pca_checkpoint(
 			record["checkpoint_path"],
 			dataset,
 			arch,
@@ -823,7 +902,9 @@ def run_pca_for_all_checkpoints(
 			model_config,
 			f"epoch_{epoch:04d}_relative_{relative_tag}",
 			probe_record=record,
-		)
+			plot=plot,
+		))
+	return outputs
 
 
 def test_cuda():

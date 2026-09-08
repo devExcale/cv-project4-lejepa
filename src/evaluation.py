@@ -132,15 +132,20 @@ def run_gradcam_pipeline(
 		val_fraction: float = CONFIG["val_fraction"],
 		output_name: str | None = None,
 ) -> str:
-	"""Extract batched Grad-CAM and Guided Grad-CAM maps for test samples."""
+	"""Extract batched Grad-CAM and Guided Grad-CAM maps across all 4 stages for test samples."""
 	model.eval().to(device)
 	backbone = getattr(model, "backbone", model)
-	if not hasattr(backbone, "layer4"):
-		raise ValueError("Grad-CAM requires a CNN backbone with a layer4 stage")
 
-	target_layer = cast(nn.Module, list(backbone.layer4.children())[-1])
-	grad_cam = GradCAM(model=model, target_layer=target_layer)
-	guided_bp = GuidedBackprop(model=model)
+	stages = ["layer1", "layer2", "layer3", "layer4"]
+	for stage in stages:
+		if not hasattr(backbone, stage):
+			raise ValueError(f"Grad-CAM requires backbone stage '{stage}'")
+
+	# Target the last convolutional block of each stage
+	target_layers = [
+		cast(nn.Module, list(getattr(backbone, stage).children())[-1])
+		for stage in stages
+	]
 
 	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
 	mean_array = np.array(mean).reshape(1, 3, 1, 1)
@@ -150,45 +155,74 @@ def run_gradcam_pipeline(
 	inputs = images_batch.to(device)
 	targets = labels_batch.to(device)
 
-	try:
-		cam_maps = grad_cam.generate_cam(inputs, target_class=targets).numpy()
-		guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
-	finally:
-		grad_cam.remove_hooks()
+	# Guided Backpropagation is computed once at the input level
+	guided_bp = GuidedBackprop(model=model)
+	guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
 
+	# Generate Grad-CAM heatmaps for each layer/stage
+	cam_maps_by_layer: list[np.ndarray] = []
+	for target_layer in target_layers:
+		grad_cam = GradCAM(model=model, target_layer=target_layer)
+		try:
+			cams = grad_cam.generate_cam(inputs, target_class=targets).numpy()
+			cam_maps_by_layer.append(cams)
+		finally:
+			grad_cam.remove_hooks()
+
+	# Denormalize input images for plotting
 	originals = inputs.detach().cpu().numpy() * std_array + mean_array
 	originals = np.clip(originals.transpose(0, 2, 3, 1), 0.0, 1.0)
 
+	# 1 input image column + 2 columns per layer (heatmap, guided) = 9 columns
 	num_samples = inputs.size(0)
-	fig, axes = plt.subplots(num_samples, 3, figsize=(9, 3 * num_samples))
-	if num_samples == 1:
-		axes = np.expand_dims(axes, 0)
+	num_cols = 1 + 2 * len(stages)
+	fig, axes = plt.subplots(
+		num_samples,
+		num_cols,
+		figsize=(2.8 * num_cols, 2.8 * num_samples),
+		squeeze=False,
+	)
 
 	for i in range(num_samples):
 		true_label = int(labels_batch[i])
 		true_label_name = get_class_name(dataset_name, true_label)
-		guided_cam = guided_grads[i] * cam_maps[i][..., np.newaxis]
-		guided_cam -= guided_cam.mean()
-		guided_cam /= guided_cam.std() + 1e-8
-		guided_cam = np.clip(guided_cam * 0.15 + 0.5, 0.0, 1.0)
 
+		# Col 0: Original input image
 		axes[i, 0].imshow(originals[i])
-		axes[i, 0].set_title(f"Sample {i + 1} ({true_label_name})", fontsize=10)
+		axes[i, 0].set_title(f"Sample {i + 1}\n({true_label_name})", fontsize=9)
 		axes[i, 0].axis("off")
 
-		axes[i, 1].imshow(cam_maps[i], cmap="jet")
-		axes[i, 1].set_title("Grad-CAM Heatmap", fontsize=10)
-		axes[i, 1].axis("off")
+		# Interleave heatmap and guided Grad-CAM for each layer
+		for stage_idx, stage_name in enumerate(stages):
+			cam = cam_maps_by_layer[stage_idx][i]
 
-		axes[i, 2].imshow(guided_cam)
-		axes[i, 2].set_title("Guided Grad-CAM", fontsize=10)
-		axes[i, 2].axis("off")
+			# Fuse guided backprop with layer-specific CAM
+			guided_cam = guided_grads[i] * cam[..., np.newaxis]
+			guided_cam -= guided_cam.mean()
+			guided_cam /= guided_cam.std() + 1e-8
+			guided_cam = np.clip(guided_cam * 0.15 + 0.5, 0.0, 1.0)
 
-	plt.tight_layout()
-	output_stem = f"gradcam_{dataset_name}_{arch}_{paradigm}"
+			col_heatmap = 1 + 2 * stage_idx
+			col_guided = 2 + 2 * stage_idx
+
+			# Grad-CAM Heatmap
+			axes[i, col_heatmap].imshow(cam, cmap="jet")
+			axes[i, col_heatmap].set_title(f"{stage_name}\nHeatmap", fontsize=9)
+			axes[i, col_heatmap].axis("off")
+
+			# Guided Grad-CAM
+			axes[i, col_guided].imshow(guided_cam)
+			axes[i, col_guided].set_title(f"{stage_name}\nGuided CAM", fontsize=9)
+			axes[i, col_guided].axis("off")
+
+	model_id = f"{dataset_name}_{arch}_{paradigm}"
+	output_stem = f"gradcam_multistage_{model_id}"
 	if output_name:
 		output_stem = f"{output_stem}_{output_name}"
-	output_filepath = os.path.join(DIR_OUTPUT, f"{output_stem}.png")
+	output_filepath = os.path.join(DIR_OUTPUT, "gradcam", output_stem, f"{output_stem}.png")
+	os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
+
+	plt.tight_layout()
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close(fig)
 

@@ -324,7 +324,7 @@ def run_gradcam_pipeline(
 	return output_filepath
 
 
-def run_GMAR_pipeline(
+def run_gmar_pipeline(
 		model: nn.Module,
 		loader: DataLoader,
 		dataset_name: str,
@@ -333,72 +333,260 @@ def run_GMAR_pipeline(
 		device: torch.device,
 		val_fraction: float = CONFIG["val_fraction"],
 		output_name: str | None = None,
+		plot: bool = True,
+		resume: bool = True,
 ) -> str:
-	"""Extract GMAR saliency maps for all loader samples."""
+	"""
+	Extract GMAR saliency heatmaps and Guided GMAR across all 6 transformer blocks.
+	"""
 
 	if loader is None:
 		raise ValueError("A DataLoader must be provided.")
 
 	model.eval().to(device)
-	gmar = GMAR(model=model)
+	backbone = getattr(model, "backbone", model)
+
+	if not hasattr(backbone, "encoder"):
+		raise ValueError("GMAR requires a ViT backbone with an 'encoder' ModuleList")
+
+	num_blocks = len(backbone.encoder)
+	block_names = [f"Block {i + 1}" for i in range(num_blocks)]
+
+	model_id = f"{dataset_name}_{arch}_{paradigm}"
+	if output_name:
+		model_id = f"{model_id}_{output_name}"
+	output_stem = f"gmar_{model_id}"
+	output_dir = os.path.join(DIR_OUTPUT, "gmar", model_id)
+	os.makedirs(output_dir, exist_ok=True)
+
+	# --- Individual tensor heatmaps (.pt files, no plot) ---
+	if not plot:
+		class_counters: dict[int, int] = {}
+		total_saved = 0
+		total_skipped = 0
+
+		for images, labels in loader:
+			batch_size = images.size(0)
+			needed_indices = []
+			sample_filepaths = []
+
+			# Check cache deterministically per sample
+			for b in range(batch_size):
+				true_label = int(labels[b])
+				point_idx = class_counters.get(true_label, 0)
+				ds_point = f"c{true_label}_{point_idx}"
+				filename = f"{output_stem}_{ds_point}.pt"
+				filepath = os.path.join(output_dir, filename)
+
+				sample_filepaths.append(filepath)
+				class_counters[true_label] = point_idx + 1
+
+				if resume and os.path.exists(filepath):
+					total_skipped += 1
+				else:
+					needed_indices.append(b)
+
+			if not needed_indices:
+				continue
+
+			sub_inputs = images[needed_indices].to(device)
+			sub_targets = labels[needed_indices].to(device)
+
+			# Extract [len(needed_indices), 32, 32, 6]
+			stacked_gmar = compute_gmar_block_heatmaps(
+				model=model,
+				inputs=sub_inputs,
+				targets=sub_targets,
+				image_size=sub_inputs.shape[-2:],
+			).detach().cpu()
+
+			for idx, b in enumerate(needed_indices):
+				torch.save(stacked_gmar[idx], sample_filepaths[b])
+				total_saved += 1
+
+		print(
+			f"[GMAR] Directory: {output_dir} | "
+			f"Saved: {total_saved} new | Skipped: {total_skipped} existing"
+		)
+		return output_dir
+
+	# --- PDF preview plot with Guided GMAR ---
+	output_filepath = os.path.join(output_dir, f"{output_stem}.pdf")
+	if resume and os.path.exists(output_filepath):
+		print(f"[GMAR Resume] Visualizations already exist at: {output_filepath}. Skipping.")
+		return output_filepath
 
 	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
 	mean_array = np.array(mean).reshape(1, 3, 1, 1)
 	std_array = np.array(std).reshape(1, 3, 1, 1)
 
+	guided_bp = GuidedBackprop(model=model)
+
 	collected_originals: list[np.ndarray] = []
 	collected_labels: list[int] = []
-	collected_gmar: list[np.ndarray] = []
+	collected_guided: list[np.ndarray] = []
+	collected_maps: list[np.ndarray] = []
 
 	for images, labels in loader:
 		inputs = images.to(device)
 		targets = labels.to(device)
 
-		gmar_maps = gmar.generate_saliency_map(
-			inputs,
-			target_category=targets,
-			image_size=inputs.shape[-2:],
-		).cpu().numpy()
-		collected_gmar.append(gmar_maps)
+		# 1. Compute pixel-level Guided Backprop
+		guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
+		collected_guided.append(guided_grads)
 
+		# 2. Compute GMAR heatmaps across all 6 blocks [B, 32, 32, 6]
+		batch_maps = compute_gmar_block_heatmaps(
+			model=model,
+			inputs=inputs,
+			targets=targets,
+			image_size=inputs.shape[-2:],
+		).detach().cpu().numpy()
+		collected_maps.append(batch_maps)
+
+		# De-normalize inputs for plotting
 		orig = inputs.detach().cpu().numpy() * std_array + mean_array
 		orig = np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0)
 		collected_originals.append(orig)
 		collected_labels.extend(labels.tolist())
 
-	if not collected_originals:
-		raise ValueError("The provided DataLoader is empty.")
-
 	originals = np.concatenate(collected_originals, axis=0)
-	gmar_maps = np.concatenate(collected_gmar, axis=0)
+	guided_grads = np.concatenate(collected_guided, axis=0)
+	all_gmar_maps = np.concatenate(collected_maps, axis=0)  # [N, 32, 32, 6]
 	total_samples = len(originals)
 
-	fig, axes = plt.subplots(total_samples, 2, figsize=(6, 3 * total_samples), squeeze=False)
+	# 1 column for original + 2 columns per block (Heatmap + Guided GMAR)
+	num_cols = 1 + 2 * num_blocks
+	fig, axes = plt.subplots(
+		total_samples,
+		num_cols,
+		figsize=(2.5 * num_cols, 2.8 * total_samples),
+		squeeze=False,
+	)
 
 	for i in range(total_samples):
 		true_label = int(collected_labels[i])
 		true_label_name = get_class_name(dataset_name, true_label)
 
+		# Col 0: Original input image
 		axes[i, 0].imshow(originals[i])
-		axes[i, 0].set_title(f"Sample {i + 1} ({true_label_name})", fontsize=10)
+		axes[i, 0].set_title(f"Sample {i + 1}\n({true_label_name})", fontsize=9)
 		axes[i, 0].axis("off")
 
-		axes[i, 1].imshow(gmar_maps[i], cmap="jet")
-		axes[i, 1].set_title("GMAR Saliency", fontsize=10)
-		axes[i, 1].axis("off")
+		# Interleave Heatmap and Guided GMAR for each block
+		for block_idx in range(num_blocks):
+			cam = all_gmar_maps[i, :, :, block_idx]
+
+			# Pointwise product between pixel-gradients and attention rollout heatmap
+			guided_gmar = guided_grads[i] * cam[..., np.newaxis]
+			guided_gmar -= guided_gmar.mean()
+			guided_gmar /= guided_gmar.std() + 1e-8
+			guided_gmar = np.clip(guided_gmar * 0.15 + 0.5, 0.0, 1.0)
+
+			col_heatmap = 1 + 2 * block_idx
+			col_guided = 2 + 2 * block_idx
+
+			# GMAR Rollout Heatmap
+			axes[i, col_heatmap].imshow(cam, cmap="jet")
+			axes[i, col_heatmap].set_title(f"{block_names[block_idx]}\nRollout", fontsize=8)
+			axes[i, col_heatmap].axis("off")
+
+			# Guided GMAR
+			axes[i, col_guided].imshow(guided_gmar)
+			axes[i, col_guided].set_title(f"{block_names[block_idx]}\nGuided GMAR", fontsize=8)
+			axes[i, col_guided].axis("off")
 
 	plt.tight_layout()
-	output_stem = f"gmar_{dataset_name}_{arch}_{paradigm}"
-	if output_name:
-		output_stem = f"{output_stem}_{output_name}"
-	output_filepath = os.path.join(DIR_OUTPUT, "gmar", f"{output_stem}.png")
-	os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
-
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close(fig)
 
 	print(f"[GMAR Complete] Visualizations saved to: {output_filepath}")
 	return output_filepath
+
+
+def compute_gmar_block_heatmaps(
+		model: nn.Module,
+		inputs: torch.Tensor,
+		targets: torch.Tensor,
+		image_size: tuple[int, int] = (32, 32),
+) -> torch.Tensor:
+	"""
+	Computes gradient-weighted multi-head attention rollout (GMAR)
+	progressively across each encoder block.
+	"""
+
+	model.eval()
+	backbone = getattr(model, "backbone", model)
+	if not hasattr(backbone, "encoder"):
+		raise ValueError("GMAR requires a ViT backbone with an 'encoder' ModuleList.")
+
+	num_blocks = len(backbone.encoder)
+	batch_size = inputs.size(0)
+
+	# Forward pass requesting attention storage and gradients
+	model.zero_grad()
+	logits = model(inputs, need_attn=True)
+
+	# Backward pass for class-specific gradients
+	loss = logits.gather(1, targets.unsqueeze(1)).sum()
+	loss.backward(retain_graph=True)
+
+	block_heatmaps = []
+	rollout_matrix = None
+	eye = torch.eye(backbone.grid_size ** 2 + 1, device=inputs.device).unsqueeze(0)  # [1, 65, 65]
+
+	for block_idx in range(num_blocks):
+		block = backbone.encoder[block_idx]
+		attn = block.attention  # Shape: [B, num_heads, 65, 65]
+
+		if attn is None or attn.grad is None:
+			raise RuntimeError(
+				f"Attention or its gradients are None at block {block_idx}. "
+				"Ensure need_attn=True was passed and retain_grad() was called."
+			)
+
+		grad = attn.grad  # [B, num_heads, 65, 65]
+
+		# Head importance: L1 norm of gradients across tokens
+		head_importance = grad.abs().sum(dim=(-2, -1), keepdim=True)  # [B, num_heads, 1, 1]
+		head_weights = head_importance / (head_importance.sum(dim=1, keepdim=True) + 1e-8)
+
+		# Gradient-weighted head aggregation
+		a_weighted = (head_weights * attn).sum(dim=1)  # [B, 65, 65]
+
+		# Residual identity connection
+		a_hat = a_weighted + 0.5 * eye
+		a_hat = a_hat / a_hat.sum(dim=-1, keepdim=True)
+
+		# Progressive rollout up to current block
+		if rollout_matrix is None:
+			rollout_matrix = a_hat
+		else:
+			rollout_matrix = torch.matmul(a_hat, rollout_matrix)
+
+		# Extract [CLS] token attributions to image patches (excluding self-weight)
+		cls_to_patches = rollout_matrix[:, 0, 1:]  # [B, 64]
+		grid_dim = backbone.grid_size  # 8 for 32x32 image with 4x4 patches
+		spatial = cls_to_patches.reshape(batch_size, 1, grid_dim, grid_dim)
+
+		# Upsample to full image resolution
+		upsampled = F.interpolate(
+			spatial, size=image_size, mode="bilinear", align_corners=False
+		).squeeze(1)  # [B, 32, 32]
+
+		# Normalize per-sample to [0, 1]
+		b_min = upsampled.amin(dim=(-2, -1), keepdim=True)
+		b_max = upsampled.amax(dim=(-2, -1), keepdim=True)
+		norm_map = (upsampled - b_min) / (b_max - b_min + 1e-8)
+		block_heatmaps.append(norm_map)
+
+	# Clean up hooks/cached gradients
+	model.zero_grad()
+	for block in backbone.encoder:
+		block.attention = None
+
+	# Stack along the final dimension: [B, 32, 32, 6]
+	return torch.stack(block_heatmaps, dim=-1)
 
 
 def evaluate_model(

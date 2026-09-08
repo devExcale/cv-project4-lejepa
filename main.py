@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from src.data import get_dataloaders, get_balanced_test_loader
-from src.evaluation import evaluate_model, run_GMAR_pipeline, run_gradcam_pipeline
+from src.evaluation import evaluate_model, run_gmar_pipeline, run_gradcam_pipeline
 from src.globals import CONFIG, DATASETS, DEVICE, set_seed
 from src.network import LinearProbeModel, build_model
 from src.train import train_lejepa, train_supervised
@@ -23,7 +23,7 @@ def parse_args():
             "eval",
             "pca",
             "gradcam",
-            "GMAR",
+            "gmar",
             "test_cuda",
             "test_config",
             "test_pipeline",
@@ -212,15 +212,15 @@ def main():
         evaluate_model(model, test_loader, device, verbose=True)
         return
 
-    if args.mode in ("gradcam", "GMAR"):
+    if args.mode in ("gradcam", "gmar"):
 
         # Ensure Grad-CAM with CNN
         if args.mode == "gradcam" and args.arch != "cnn":
             raise ValueError("Grad-CAM requires arch='cnn'.")
 
         # Ensure GMAR with ViT
-        if args.mode == "GMAR" and args.arch != "vit":
-            raise ValueError("GMAR requires arch='vit'.")
+        if args.mode == "gmar" and args.arch != "vit":
+            raise ValueError("gmar requires arch='vit'.")
 
         summary = load_probe_summary(args.dataset, args.arch, args.paradigm)
         num_classes = DATASETS[args.dataset]["num_classes"]
@@ -295,7 +295,7 @@ def main():
                     resume=args.resume,
                 )
             else:
-                run_GMAR_pipeline(
+                run_gmar_pipeline(
                     probe_model,
                     test_loader,
                     args.dataset,
@@ -304,6 +304,8 @@ def main():
                     device,
                     val_fraction=args.val_fraction,
                     output_name=output_name,
+                    plot=args.plot,
+                    resume=args.resume,
                 )
 
             del probe_model, model

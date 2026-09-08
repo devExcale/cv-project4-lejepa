@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("-r", "--resume", action="store_true")
     parser.add_argument("--skip_postprocess", action="store_true")
     parser.add_argument("--eval-class-samples", type=int, default=1)
+    parser.add_argument("--plot", action="store_true", help="Enable plotting for Grad-CAM or GMAR visualizations")
     return parser.parse_args()
 
 
@@ -289,6 +290,7 @@ def main():
                     device,
                     val_fraction=args.val_fraction,
                     output_name=output_name,
+                    plot=args.plot,
                 )
             else:
                 run_GMAR_pipeline(

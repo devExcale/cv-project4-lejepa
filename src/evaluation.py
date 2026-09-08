@@ -109,9 +109,10 @@ def run_gradcam_pipeline(
 		device: torch.device,
 		val_fraction: float = CONFIG["val_fraction"],
 		output_name: str | None = None,
+		plot: bool = True,
 ) -> str:
 	"""
-	Extract Grad-CAM and Guided Grad-CAM maps across all 4 stages for all loader samples.
+	Extract Grad-CAM maps across all 4 stages for all samples in the loader.
 	"""
 
 	if loader is None:
@@ -130,6 +131,57 @@ def run_gradcam_pipeline(
 		for stage in stages
 	]
 
+	model_id = f"{dataset_name}_{arch}_{paradigm}"
+	if output_name:
+		model_id = f"{model_id}_{output_name}"
+	output_stem = f"gradcam_{model_id}"
+	output_dir = os.path.join(DIR_OUTPUT, "gradcam", model_id)
+	os.makedirs(output_dir, exist_ok=True)
+
+	# --- Individual heatmaps (no plot) ---
+	if not plot:
+		class_counters: dict[int, int] = {}
+		total_saved = 0
+
+		for images, labels in loader:
+			inputs = images.to(device)
+			targets = labels.to(device)
+
+			# Compute Grad-CAM heatmaps for each stage across this batch
+			batch_cams: list[np.ndarray] = []
+			for target_layer in target_layers:
+				grad_cam = GradCAM(model=model, target_layer=target_layer)
+				try:
+					cams = grad_cam.generate_cam(inputs, target_class=targets).numpy()
+					batch_cams.append(cams)
+				finally:
+					grad_cam.remove_hooks()
+
+			# Save each sample's layer heatmaps to distinct files
+			batch_size = inputs.size(0)
+			for b in range(batch_size):
+				true_label = int(labels[b])
+				sample_idx = class_counters.get(true_label, 0)
+				ds_point = f"c{true_label}_{sample_idx}"
+
+				for stage_idx in range(len(stages)):
+					layer_hm = stage_idx + 1  # 1..4
+					cam = batch_cams[stage_idx][b]
+
+					filename = f"{output_stem}_{ds_point}_{layer_hm}.png"
+					filepath = os.path.join(output_dir, filename)
+					plt.imsave(filepath, cam, cmap="jet")
+
+				class_counters[true_label] = sample_idx + 1
+				total_saved += 1
+
+		print(
+			f"[Grad-CAM Complete] Saved {total_saved * len(stages)} individual heatmaps "
+			f"({total_saved} samples x 4 layers) to: {output_dir}"
+		)
+		return output_dir
+
+	# --- Preview plot (gradcam heatmaps + guided backprop) ---
 	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
 	mean_array = np.array(mean).reshape(1, 3, 1, 1)
 	std_array = np.array(std).reshape(1, 3, 1, 1)
@@ -141,7 +193,6 @@ def run_gradcam_pipeline(
 	collected_guided: list[np.ndarray] = []
 	collected_cams: list[list[np.ndarray]] = [[] for _ in stages]
 
-	# Process all batches as structured by the DataLoader
 	for images, labels in loader:
 		inputs = images.to(device)
 		targets = labels.to(device)
@@ -161,9 +212,6 @@ def run_gradcam_pipeline(
 		orig = np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0)
 		collected_originals.append(orig)
 		collected_labels.extend(labels.tolist())
-
-	if not collected_originals:
-		raise ValueError("The provided DataLoader is empty.")
 
 	originals = np.concatenate(collected_originals, axis=0)
 	guided_grads = np.concatenate(collected_guided, axis=0)
@@ -207,13 +255,7 @@ def run_gradcam_pipeline(
 			axes[i, col_guided].set_title(f"{stage_name}\nGuided CAM", fontsize=9)
 			axes[i, col_guided].axis("off")
 
-	model_id = f"{dataset_name}_{arch}_{paradigm}"
-	output_stem = f"gradcam_{model_id}"
-	if output_name:
-		output_stem = f"{output_stem}_{output_name}"
-	output_filepath = os.path.join(DIR_OUTPUT, "gradcam", output_stem, f"{output_stem}.png")
-	os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
-
+	output_filepath = os.path.join(output_dir, f"{output_stem}.pdf")
 	plt.tight_layout()
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close(fig)

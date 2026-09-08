@@ -254,7 +254,6 @@ def run_gradcam_pipeline(
 		output_name: str | None = None,
 		plot: bool = True,
 		resume: bool = True,
-		split_by_correct: bool = False,
 ) -> str:
 	"""
 	Extract Grad-CAM maps across all 4 stages with correct/miss sample labels.
@@ -285,6 +284,11 @@ def run_gradcam_pipeline(
 
 	# --- Individual tensor heatmaps (no plot) ---
 	if not plot:
+		correct_dir = os.path.join(output_dir, "correct")
+		missed_dir = os.path.join(output_dir, "missed")
+		os.makedirs(correct_dir, exist_ok=True)
+		os.makedirs(missed_dir, exist_ok=True)
+
 		class_counters: dict[int, int] = {}
 		total_saved = 0
 		total_skipped = 0
@@ -292,17 +296,20 @@ def run_gradcam_pipeline(
 		for images, labels in loader:
 			batch_size = images.size(0)
 			needed_indices = []
-			sample_filepaths = []
+			sample_filenames = []
 
-			# Resolve filenames and check disk cache deterministically
+			# Check cache deterministically across both correct and missed folders
 			for b in range(batch_size):
 				true_label = int(labels[b])
 				point_idx = class_counters.get(true_label, 0)
-				filepath = os.path.join(output_dir, f"{output_stem}_c{true_label}_{point_idx}.pt")
-				sample_filepaths.append(filepath)
+				filename = f"{output_stem}_c{true_label}_{point_idx}.pt"
+				sample_filenames.append(filename)
 				class_counters[true_label] = point_idx + 1
 
-				if resume and os.path.exists(filepath):
+				cached_correct = os.path.join(correct_dir, filename)
+				cached_missed = os.path.join(missed_dir, filename)
+
+				if resume and (os.path.exists(cached_correct) or os.path.exists(cached_missed)):
 					total_skipped += 1
 				else:
 					needed_indices.append(b)
@@ -314,6 +321,9 @@ def run_gradcam_pipeline(
 			# Slice batch to compute Grad-CAM for missing samples
 			sub_inputs = images[needed_indices].to(device)
 			sub_targets = labels[needed_indices].to(device)
+
+			with torch.no_grad():
+				preds = model(sub_inputs).argmax(dim=-1)
 
 			batch_cams = []
 			for target_layer in target_layers:
@@ -327,9 +337,11 @@ def run_gradcam_pipeline(
 			# Stack along final axis: [len(needed_indices), 32, 32, 4]
 			stacked_cams = torch.stack(batch_cams, dim=-1)
 
-			# Save only the newly computed heatmaps
+			# Route each tensor into correct/ or missed/
 			for idx, b in enumerate(needed_indices):
-				torch.save(stacked_cams[idx], sample_filepaths[b])
+				is_correct = (preds[idx].item() == int(labels[b]))
+				target_dir = correct_dir if is_correct else missed_dir
+				torch.save(stacked_cams[idx], os.path.join(target_dir, sample_filenames[b]))
 				total_saved += 1
 
 		print(f"[Grad-CAM] Directory: {output_dir} | Saved: {total_saved} new | Skipped: {total_skipped} existing")
@@ -407,7 +419,7 @@ def run_gmar_pipeline(
 		resume: bool = True,
 ) -> str:
 	"""
-	Extract GMAR saliency heatmaps across all 6 blocks with correct/miss sample labels.
+	Extract GMAR saliency heatmaps across all 6 blocks with correct/missed folder distribution.
 	"""
 
 	if loader is None:
@@ -431,6 +443,11 @@ def run_gmar_pipeline(
 
 	# --- Individual tensor heatmaps (.pt files, no plot) ---
 	if not plot:
+		correct_dir = os.path.join(output_dir, "correct")
+		missed_dir = os.path.join(output_dir, "missed")
+		os.makedirs(correct_dir, exist_ok=True)
+		os.makedirs(missed_dir, exist_ok=True)
+
 		class_counters: dict[int, int] = {}
 		total_saved = 0
 		total_skipped = 0
@@ -438,17 +455,20 @@ def run_gmar_pipeline(
 		for images, labels in loader:
 			batch_size = images.size(0)
 			needed_indices = []
-			sample_filepaths = []
+			sample_filenames = []
 
-			# Check cache deterministically per sample
+			# Check cache deterministically across both correct and missed folders
 			for b in range(batch_size):
 				true_label = int(labels[b])
 				point_idx = class_counters.get(true_label, 0)
-				filepath = os.path.join(output_dir, f"{output_stem}_c{true_label}_{point_idx}.pt")
-				sample_filepaths.append(filepath)
+				filename = f"{output_stem}_c{true_label}_{point_idx}.pt"
+				sample_filenames.append(filename)
 				class_counters[true_label] = point_idx + 1
 
-				if resume and os.path.exists(filepath):
+				cached_correct = os.path.join(correct_dir, filename)
+				cached_missed = os.path.join(missed_dir, filename)
+
+				if resume and (os.path.exists(cached_correct) or os.path.exists(cached_missed)):
 					total_skipped += 1
 				else:
 					needed_indices.append(b)
@@ -459,6 +479,9 @@ def run_gmar_pipeline(
 			sub_inputs = images[needed_indices].to(device)
 			sub_targets = labels[needed_indices].to(device)
 
+			with torch.no_grad():
+				preds = model(sub_inputs).argmax(dim=-1)
+
 			# Extract [len(needed_indices), 32, 32, 6]
 			stacked_gmar = compute_gmar_block_heatmaps(
 				model=model,
@@ -467,8 +490,11 @@ def run_gmar_pipeline(
 				image_size=sub_inputs.shape[-2:],
 			).detach().cpu()
 
+			# Route each tensor into correct/ or missed/
 			for idx, b in enumerate(needed_indices):
-				torch.save(stacked_gmar[idx], sample_filepaths[b])
+				is_correct = (preds[idx].item() == int(labels[b]))
+				target_dir = correct_dir if is_correct else missed_dir
+				torch.save(stacked_gmar[idx], os.path.join(target_dir, sample_filenames[b]))
 				total_saved += 1
 
 		print(

@@ -42,20 +42,59 @@ def spatial_pca(feature_map: torch.Tensor, k: int = 3, image_index: int = 0) -> 
 	return projected.reshape(h, w, k).cpu()
 
 
-def pca_outputs(feature_map: torch.Tensor, image_index: int = 0) -> dict[str, torch.Tensor]:
-	"""Run PCA once and derive the PC1 mask and RGB map from that decomposition."""
+def _normalize_map(x: torch.Tensor) -> torch.Tensor:
+	minimum = x.min()
+	maximum = x.max()
+	return (x - minimum) / (maximum - minimum).clamp_min(1e-8)
+
+
+def pca_outputs(
+	feature_map: torch.Tensor,
+	image_index: int = 0,
+	output_size: tuple[int, int] | None = None,
+) -> dict[str, torch.Tensor]:
+	"""Run PCA once and derive comparable semantic outputs plus an RGB visualization.
+
+	Returns:
+		components: raw PCA scores at feature-map resolution, shaped [Hf, Wf, 3]
+		pc1: normalized first principal component at feature-map resolution, [Hf, Wf]
+		semantic_map: normalized PC1 optionally resized to ``output_size``, [H, W]
+		mask: binary threshold of ``semantic_map`` at its mean, [H, W]
+		rgb: normalized pseudo-RGB visualization (PC1/PC2/PC3), [Hf, Wf, 3]
+	"""
 	projected = spatial_pca(feature_map, k=3, image_index=image_index)
-	pc1 = projected[..., 0]
-	mask = pc1 > pc1.mean()
+	pc1 = _normalize_map(projected[..., 0])
+
+	semantic_map = pc1
+	if output_size is not None:
+		semantic_map = F.interpolate(
+			pc1.unsqueeze(0).unsqueeze(0),
+			size=output_size,
+			mode="bilinear",
+			align_corners=False,
+		).squeeze(0).squeeze(0)
+		semantic_map = _normalize_map(semantic_map)
+
+	mask = semantic_map > semantic_map.mean()
 
 	mins = projected.amin(dim=(0, 1), keepdim=True)
 	maxs = projected.amax(dim=(0, 1), keepdim=True)
 	rgb = (projected - mins) / (maxs - mins).clamp_min(1e-8)
-	return {"components": projected, "mask": mask, "rgb": rgb}
+	return {
+		"components": projected,
+		"pc1": pc1,
+		"semantic_map": semantic_map,
+		"mask": mask,
+		"rgb": rgb,
+	}
 
 
-def pca_mask(feature_map: torch.Tensor, image_index: int = 0) -> torch.Tensor:
-	return pca_outputs(feature_map, image_index=image_index)["mask"]
+def pca_mask(
+	feature_map: torch.Tensor,
+	image_index: int = 0,
+	output_size: tuple[int, int] | None = None,
+) -> torch.Tensor:
+	return pca_outputs(feature_map, image_index=image_index, output_size=output_size)["mask"]
 
 
 def pca_rgb(feature_map: torch.Tensor, image_index: int = 0) -> torch.Tensor:

@@ -138,7 +138,7 @@ def run_gradcam_pipeline(
 	output_dir = os.path.join(DIR_OUTPUT, "gradcam", model_id)
 	os.makedirs(output_dir, exist_ok=True)
 
-	# --- Individual heatmaps (no plot) ---
+	# --- Individual tensor heatmaps (no plot) ---
 	if not plot:
 		class_counters: dict[int, int] = {}
 		total_saved = 0
@@ -147,37 +147,38 @@ def run_gradcam_pipeline(
 			inputs = images.to(device)
 			targets = labels.to(device)
 
-			# Compute Grad-CAM heatmaps for each stage across this batch
-			batch_cams: list[np.ndarray] = []
+			# Extract [B, 32, 32] heatmap tensors per stage
+			batch_cams: list[torch.Tensor] = []
 			for target_layer in target_layers:
 				grad_cam = GradCAM(model=model, target_layer=target_layer)
 				try:
-					cams = grad_cam.generate_cam(inputs, target_class=targets).numpy()
+					# generate_cam returns a Tensor of shape [B, H, W] in [0, 1]
+					cams = grad_cam.generate_cam(inputs, target_class=targets)
 					batch_cams.append(cams)
 				finally:
 					grad_cam.remove_hooks()
 
-			# Save each sample's layer heatmaps to distinct files
+			# Stack along the final dimension: [B, 32, 32, 4]
+			stacked_cams = torch.stack(batch_cams, dim=-1)
+
 			batch_size = inputs.size(0)
 			for b in range(batch_size):
 				true_label = int(labels[b])
-				sample_idx = class_counters.get(true_label, 0)
-				ds_point = f"c{true_label}_{sample_idx}"
+				point_idx = class_counters.get(true_label, 0)
+				ds_point = f"c{true_label}_{point_idx}"
 
-				for stage_idx in range(len(stages)):
-					layer_hm = stage_idx + 1  # 1..4
-					cam = batch_cams[stage_idx][b]
+				filename = f"{output_stem}_{ds_point}.pt"
+				filepath = os.path.join(output_dir, filename)
 
-					filename = f"{output_stem}_{ds_point}_{layer_hm}.png"
-					filepath = os.path.join(output_dir, filename)
-					plt.imsave(filepath, cam, cmap="jet")
+				# Save the [32, 32, 4] tensor directly
+				torch.save(stacked_cams[b], filepath)
 
-				class_counters[true_label] = sample_idx + 1
+				class_counters[true_label] = point_idx + 1
 				total_saved += 1
 
 		print(
-			f"[Grad-CAM Complete] Saved {total_saved * len(stages)} individual heatmaps "
-			f"({total_saved} samples x 4 layers) to: {output_dir}"
+			f"[Grad-CAM Complete] Saved {total_saved} tensor heatmaps of shape [32, 32, 4] "
+			f"to: {output_dir}"
 		)
 		return output_dir
 

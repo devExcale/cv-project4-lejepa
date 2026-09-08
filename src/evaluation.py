@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from copy import deepcopy
 from typing import Tuple, cast
@@ -9,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from matplotlib import pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -111,9 +113,12 @@ def _save_saliency_pdf(
 		layer_names: list[str],
 		guided_grads: np.ndarray | None = None,
 		method_name: str = "CAM",
-):
+		samples_per_page: int = 10,
+		dpi: int = 120,
+) -> None:
 	"""
-	Internal helper to render multi-column PDF previews with correctness status.
+	Renders a multi-page PDF using PdfPages, generating small page figures
+	and immediately closing them to prevent Python & PDF viewer memory blowups.
 	"""
 
 	total_samples = len(originals)
@@ -122,69 +127,81 @@ def _save_saliency_pdf(
 
 	num_layers = len(layer_names)
 	has_guided = guided_grads is not None
-	# 1 column for original; 2 per layer if guided is present, else 1 per layer
 	num_cols = 1 + (2 * num_layers if has_guided else num_layers)
+	num_pages = math.ceil(total_samples / samples_per_page)
 
-	fig, axes = plt.subplots(
-		total_samples,
-		num_cols,
-		figsize=(2.6 * num_cols, 2.8 * total_samples),
-		squeeze=False,
-	)
-
-	for i in range(total_samples):
-		true_label = int(labels[i])
-		pred_label = int(preds[i])
-		true_label_name = get_class_name(dataset_name, true_label)
-		pred_label_name = get_class_name(dataset_name, pred_label)
-		is_correct = (pred_label == true_label)
-
-		# Status badge formatting
-		status_tag = "[CORRECT]" if is_correct else f"[MISS: Pred {pred_label_name}]"
-		status_color = "darkgreen" if is_correct else "crimson"
-
-		# Column 0: Original input image
-		axes[i, 0].imshow(originals[i])
-		axes[i, 0].set_title(
-			f"Sample {i + 1}: {true_label_name}\n{status_tag}",
-			fontsize=8,
-			fontweight="bold",
-			color=status_color,
-		)
-		axes[i, 0].axis("off")
-
-		# Layer-wise attributions
-		for l_idx, layer_name in enumerate(layer_names):
-			cam = heatmaps_by_layer[l_idx][i]
-
-			if has_guided:
-				col_heat = 1 + 2 * l_idx
-				col_guided = 2 + 2 * l_idx
-
-				# Heatmap
-				axes[i, col_heat].imshow(cam, cmap="jet")
-				axes[i, col_heat].set_title(f"{layer_name}\nHeatmap", fontsize=8)
-				axes[i, col_heat].axis("off")
-
-				# Guided overlay
-				guided = guided_grads[i] * cam[..., np.newaxis]
-				guided -= guided.mean()
-				guided /= (guided.std() + 1e-8)
-				guided = np.clip(guided * 0.15 + 0.5, 0.0, 1.0)
-
-				axes[i, col_guided].imshow(guided)
-				axes[i, col_guided].set_title(f"{layer_name}\nGuided {method_name}", fontsize=8)
-				axes[i, col_guided].axis("off")
-			else:
-				col_heat = 1 + l_idx
-				axes[i, col_heat].imshow(cam, cmap="jet")
-				axes[i, col_heat].set_title(f"{layer_name}\n{method_name}", fontsize=8)
-				axes[i, col_heat].axis("off")
-
-	plt.tight_layout()
 	os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
-	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
-	plt.close(fig)
+
+	with PdfPages(output_filepath) as pdf:
+		for page_idx in range(num_pages):
+			start_i = page_idx * samples_per_page
+			end_i = min(start_i + samples_per_page, total_samples)
+			page_samples = end_i - start_i
+
+			# Create a manageable figure for just this page
+			fig, axes = plt.subplots(
+				page_samples,
+				num_cols,
+				figsize=(2.4 * num_cols, 2.5 * page_samples),
+				squeeze=False,
+			)
+
+			for row_idx, sample_i in enumerate(range(start_i, end_i)):
+				true_label = int(labels[sample_i])
+				pred_label = int(preds[sample_i])
+				true_label_name = get_class_name(dataset_name, true_label)
+				pred_label_name = get_class_name(dataset_name, pred_label)
+				is_correct = (pred_label == true_label)
+
+				status_tag = "[CORRECT]" if is_correct else f"[MISS: Pred {pred_label_name}]"
+				status_color = "darkgreen" if is_correct else "crimson"
+
+				# Col 0: Input image
+				axes[row_idx, 0].imshow(originals[sample_i], rasterized=True)
+				axes[row_idx, 0].set_title(
+					f"#{sample_i + 1}: {true_label_name}\n{status_tag}",
+					fontsize=8,
+					fontweight="bold",
+					color=status_color,
+				)
+				axes[row_idx, 0].axis("off")
+
+				# Columns for each layer / block
+				for l_idx, layer_name in enumerate(layer_names):
+					cam = heatmaps_by_layer[l_idx][sample_i]
+
+					if has_guided:
+						col_heat = 1 + 2 * l_idx
+						col_guided = 2 + 2 * l_idx
+
+						# Rollout Heatmap
+						axes[row_idx, col_heat].imshow(cam, cmap="jet", rasterized=True)
+						axes[row_idx, col_heat].set_title(f"{layer_name}\nHeatmap", fontsize=8)
+						axes[row_idx, col_heat].axis("off")
+
+						# Guided overlay
+						guided = guided_grads[sample_i] * cam[..., np.newaxis]
+						guided -= guided.mean()
+						guided /= (guided.std() + 1e-8)
+						guided = np.clip(guided * 0.15 + 0.5, 0.0, 1.0)
+
+						axes[row_idx, col_guided].imshow(guided, rasterized=True)
+						axes[row_idx, col_guided].set_title(f"{layer_name}\nGuided {method_name}", fontsize=8)
+						axes[row_idx, col_guided].axis("off")
+					else:
+						col_heat = 1 + l_idx
+						axes[row_idx, col_heat].imshow(cam, cmap="jet", rasterized=True)
+						axes[row_idx, col_heat].set_title(f"{layer_name}\n{method_name}", fontsize=8)
+						axes[row_idx, col_heat].axis("off")
+
+			# Save the individual page figure into the multi-page stream
+			plt.tight_layout()
+			pdf.savefig(fig, dpi=dpi, bbox_inches="tight")
+
+			# Destroy the figure and free buffers
+			plt.close(fig)
+
+	return
 
 
 def run_gradcam_pipeline(

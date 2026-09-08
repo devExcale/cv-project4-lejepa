@@ -298,7 +298,7 @@ def run_gmar_pipeline(
 		resume: bool = True,
 ) -> str:
 	"""
-	Extract GMAR saliency maps across all 6 transformer blocks for all samples in the loader.
+	Extract GMAR saliency heatmaps and Guided GMAR across all 6 transformer blocks.
 	"""
 
 	if loader is None:
@@ -371,7 +371,7 @@ def run_gmar_pipeline(
 		)
 		return output_dir
 
-	# --- PDF preview plot ---
+	# --- PDF preview plot with Guided GMAR ---
 	output_filepath = os.path.join(output_dir, f"{output_stem}.pdf")
 	if resume and os.path.exists(output_filepath):
 		print(f"[GMAR Resume] Visualizations already exist at: {output_filepath}. Skipping.")
@@ -381,14 +381,22 @@ def run_gmar_pipeline(
 	mean_array = np.array(mean).reshape(1, 3, 1, 1)
 	std_array = np.array(std).reshape(1, 3, 1, 1)
 
+	guided_bp = GuidedBackprop(model=model)
+
 	collected_originals: list[np.ndarray] = []
 	collected_labels: list[int] = []
+	collected_guided: list[np.ndarray] = []
 	collected_maps: list[np.ndarray] = []
 
 	for images, labels in loader:
 		inputs = images.to(device)
 		targets = labels.to(device)
 
+		# 1. Compute pixel-level Guided Backprop
+		guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
+		collected_guided.append(guided_grads)
+
+		# 2. Compute GMAR heatmaps across all 6 blocks [B, 32, 32, 6]
 		batch_maps = compute_gmar_block_heatmaps(
 			model=model,
 			inputs=inputs,
@@ -397,20 +405,23 @@ def run_gmar_pipeline(
 		).detach().cpu().numpy()
 		collected_maps.append(batch_maps)
 
+		# De-normalize inputs for plotting
 		orig = inputs.detach().cpu().numpy() * std_array + mean_array
 		orig = np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0)
 		collected_originals.append(orig)
 		collected_labels.extend(labels.tolist())
 
 	originals = np.concatenate(collected_originals, axis=0)
-	all_gmar_maps = np.concatenate(collected_maps, axis=0)  # [Total, 32, 32, 6]
+	guided_grads = np.concatenate(collected_guided, axis=0)
+	all_gmar_maps = np.concatenate(collected_maps, axis=0)  # [N, 32, 32, 6]
 	total_samples = len(originals)
 
-	num_cols = 1 + num_blocks  # Col 0: Original, Cols 1..6: Blocks 1..6
+	# 1 column for original + 2 columns per block (Heatmap + Guided GMAR)
+	num_cols = 1 + 2 * num_blocks
 	fig, axes = plt.subplots(
 		total_samples,
 		num_cols,
-		figsize=(2.5 * num_cols, 2.5 * total_samples),
+		figsize=(2.5 * num_cols, 2.8 * total_samples),
 		squeeze=False,
 	)
 
@@ -418,17 +429,33 @@ def run_gmar_pipeline(
 		true_label = int(collected_labels[i])
 		true_label_name = get_class_name(dataset_name, true_label)
 
-		# Col 0: Input image
+		# Col 0: Original input image
 		axes[i, 0].imshow(originals[i])
 		axes[i, 0].set_title(f"Sample {i + 1}\n({true_label_name})", fontsize=9)
 		axes[i, 0].axis("off")
 
-		# Cols 1 to 6: Saliency heatmaps across blocks
+		# Interleave Heatmap and Guided GMAR for each block
 		for block_idx in range(num_blocks):
-			col_idx = 1 + block_idx
-			axes[i, col_idx].imshow(all_gmar_maps[i, :, :, block_idx], cmap="jet")
-			axes[i, col_idx].set_title(f"{block_names[block_idx]}\nRollout", fontsize=9)
-			axes[i, col_idx].axis("off")
+			cam = all_gmar_maps[i, :, :, block_idx]
+
+			# Pointwise product between pixel-gradients and attention rollout heatmap
+			guided_gmar = guided_grads[i] * cam[..., np.newaxis]
+			guided_gmar -= guided_gmar.mean()
+			guided_gmar /= guided_gmar.std() + 1e-8
+			guided_gmar = np.clip(guided_gmar * 0.15 + 0.5, 0.0, 1.0)
+
+			col_heatmap = 1 + 2 * block_idx
+			col_guided = 2 + 2 * block_idx
+
+			# GMAR Rollout Heatmap
+			axes[i, col_heatmap].imshow(cam, cmap="jet")
+			axes[i, col_heatmap].set_title(f"{block_names[block_idx]}\nRollout", fontsize=8)
+			axes[i, col_heatmap].axis("off")
+
+			# Guided GMAR
+			axes[i, col_guided].imshow(guided_gmar)
+			axes[i, col_guided].set_title(f"{block_names[block_idx]}\nGuided GMAR", fontsize=8)
+			axes[i, col_guided].axis("off")
 
 	plt.tight_layout()
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")

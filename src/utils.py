@@ -14,33 +14,39 @@ from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, DIR_OUTPUT, s
 from src.network import AttentionEncoder, build_model
 
 
-def _guided_relu_backward_hook(module, grad_in, grad_out):
-	"""Clamp negative ReLU input gradients for guided backpropagation."""
+def _guided_act_backward_hook(module, grad_in, grad_out):
+	"""
+	Clamp negative input gradients for guided backpropagation.
+	Works for both nn.ReLU and nn.GELU.
+	"""
 	if isinstance(grad_in[0], torch.Tensor):
 		return (torch.clamp(grad_in[0], min=0.0),)
 	return None
 
 
 class GuidedBackprop:
-	"""Guided Backpropagation hook manager for capturing fine pixel gradients."""
+	"""
+	Guided Backpropagation hook manager supporting both CNNs (ReLU) and ViTs (GELU).
+	"""
 
 	def __init__(self, model: nn.Module):
 		self.model = model
 		self.hooks = []
-		# In-place ReLUs break backward hooks; disable them across the entire model.
 		for module in self.model.modules():
 			if isinstance(module, nn.ReLU):
 				module.inplace = False
 
 	def _register_hooks(self):
 		for module in self.model.modules():
-			if isinstance(module, nn.ReLU):
-				self.hooks.append(module.register_full_backward_hook(_guided_relu_backward_hook))
+			if isinstance(module, (nn.ReLU, nn.GELU)):
+				self.hooks.append(
+					module.register_full_backward_hook(_guided_act_backward_hook)
+				)
 
 	def generate_gradients(
-		self,
-		input_tensor: torch.Tensor,
-		target_class: int | torch.Tensor | None = None,
+			self,
+			input_tensor: torch.Tensor,
+			target_class: int | torch.Tensor | None = None,
 	) -> np.ndarray:
 		"""Return guided input gradients as [B, H, W, C]."""
 		self.model.eval()

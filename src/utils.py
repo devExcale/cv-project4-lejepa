@@ -11,7 +11,7 @@ from matplotlib import pyplot as plt
 
 from src.data import get_dataloaders, get_or_compute_stats
 from src.globals import CONFIG, DATASETS, DEVICE, DIR_CHECKPOINTS, DIR_OUTPUT, set_seed
-from src.network import AttentionEncoder, build_model
+from src.network import AttentionEncoder, LinearProbeModel, build_model
 
 
 def _guided_act_backward_hook(module, grad_in, grad_out):
@@ -728,7 +728,7 @@ def _run_pca_checkpoint(
 	probe_record: Dict | None = None,
 	plot: bool = False,
 ):
-	"""Run spatial PCA for one checkpoint, saving tensors or a visual preview."""
+	"""Run spatial PCA for one checkpoint and retain both correct and missed predictions."""
 	from src.evaluation import pca_outputs
 
 	checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -746,6 +746,26 @@ def _run_pca_checkpoint(
 
 	epoch = int(checkpoint.get("epoch", -1))
 	probe_record = probe_record or {}
+	probe_path = probe_record.get("probe_path")
+	if not probe_path or not os.path.exists(probe_path):
+		raise FileNotFoundError(
+			f"PCA requires the completed linear probe for backbone epoch {epoch}, "
+			f"but it was not found at '{probe_path}'. Run mode 'probe' first."
+		)
+
+	probe_checkpoint = torch.load(probe_path, map_location="cpu")
+	if not probe_checkpoint.get("completed", False):
+		raise RuntimeError(
+			f"Probe for backbone epoch {epoch} is incomplete. "
+			"Resume mode 'probe' before running PCA."
+		)
+
+	backbone = model.backbone if paradigm == "lejepa" else model
+	head = nn.Linear(backbone.embed_dim, DATASETS[dataset]["num_classes"]).to(device)
+	head.load_state_dict(probe_checkpoint["head_state_dict"])
+	probe_model = LinearProbeModel(backbone, head).to(device)
+	probe_model.eval()
+
 	output_root = os.path.join(
 		DIR_OUTPUT,
 		"pca",
@@ -756,10 +776,14 @@ def _run_pca_checkpoint(
 	os.makedirs(output_root, exist_ok=True)
 
 	saved = 0
+	correct_saved = 0
+	missed_saved = 0
 	sample_index = 0
 	num_layers = None
 	plot_originals: list[torch.Tensor] = []
 	plot_labels: list[int] = []
+	plot_preds: list[int] = []
+	plot_correct: list[bool] = []
 	plot_rgb_by_sample: list[list[torch.Tensor]] = []
 
 	with torch.no_grad():
@@ -768,14 +792,24 @@ def _run_pca_checkpoint(
 			if remaining <= 0:
 				break
 
+			# As in the original PCA path, num_samples is the total number of test
+			# samples considered. Each one is then routed by prediction correctness.
 			images = images[:remaining]
 			labels = labels[:remaining]
-			features = _get_spatial_feature_maps(model, images.to(device, non_blocking=True))
+			inputs = images.to(device, non_blocking=True)
+			targets = labels.to(device, non_blocking=True)
+
+			preds = probe_model(inputs).argmax(dim=-1)
+			features = _get_spatial_feature_maps(probe_model, inputs)
 			originals = denormalize(images, dataset, val_fraction=val_fraction)
 			num_layers = len(features)
 
 			for batch_index in range(images.size(0)):
 				sample_rgb: list[torch.Tensor] = []
+				true_label = int(labels[batch_index])
+				pred_label = int(preds[batch_index].item())
+				is_correct = pred_label == true_label
+				status_dir = "correct" if is_correct else "missed"
 
 				for layer_index, feature_map in enumerate(features):
 					result = pca_outputs(feature_map, image_index=batch_index)
@@ -786,6 +820,7 @@ def _run_pca_checkpoint(
 
 					result_dir = os.path.join(
 						output_root,
+						status_dir,
 						f"layer_{layer_index:02d}",
 						f"sample_{sample_index:05d}",
 					)
@@ -794,14 +829,16 @@ def _run_pca_checkpoint(
 					metadata = {
 						"dataset": dataset,
 						"sample_index": sample_index,
-						"label": int(labels[batch_index]),
+						"label": true_label,
+						"prediction": pred_label,
+						"correct": is_correct,
 						"architecture": arch,
 						"paradigm": paradigm,
 						"epoch": epoch,
 						"layer_index": layer_index,
 						"pca_components": 3,
 						"checkpoint_path": checkpoint_path,
-						"probe_path": probe_record.get("probe_path"),
+						"probe_path": probe_path,
 						"probe_val_acc": probe_record.get("val_acc"),
 						"probe_test_acc": probe_record.get("test_acc"),
 						"relative_accuracy": probe_record.get("relative_accuracy"),
@@ -818,9 +855,15 @@ def _run_pca_checkpoint(
 
 				if plot:
 					plot_originals.append(originals[batch_index])
-					plot_labels.append(int(labels[batch_index]))
+					plot_labels.append(true_label)
+					plot_preds.append(pred_label)
+					plot_correct.append(is_correct)
 					plot_rgb_by_sample.append(sample_rgb)
 
+				if is_correct:
+					correct_saved += 1
+				else:
+					missed_saved += 1
 				sample_index += 1
 				saved += 1
 
@@ -829,8 +872,9 @@ def _run_pca_checkpoint(
 
 	if not plot:
 		print(
-			f"[PCA] Epoch {epoch}: saved tensors for {saved} test samples "
-			f"across {num_layers} feature layers to '{output_root}'."
+			f"[PCA] Epoch {epoch}: saved {saved} test samples "
+			f"({correct_saved} correct, {missed_saved} missed) across {num_layers} "
+			f"feature layers to '{output_root}'."
 		)
 		return output_root
 
@@ -847,7 +891,11 @@ def _run_pca_checkpoint(
 	for row in range(saved):
 		original = plot_originals[row].permute(1, 2, 0).numpy()
 		axes[row, 0].imshow(original)
-		axes[row, 0].set_title(f"Sample {row + 1}\nLabel {plot_labels[row]}", fontsize=9)
+		status = "[CORRECT]" if plot_correct[row] else f"[MISS: Pred {plot_preds[row]}]"
+		axes[row, 0].set_title(
+			f"Sample {row + 1}\nLabel {plot_labels[row]} {status}",
+			fontsize=9,
+		)
 		axes[row, 0].axis("off")
 
 		for layer_index, rgb in enumerate(plot_rgb_by_sample[row]):
@@ -862,7 +910,10 @@ def _run_pca_checkpoint(
 	output_filepath = os.path.join(output_root, "pca_preview.png")
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close(fig)
-	print(f"[PCA Complete] Visualization saved to: {output_filepath}")
+	print(
+		f"[PCA Complete] Saved {saved} samples ({correct_saved} correct, "
+		f"{missed_saved} missed). Visualization saved to: {output_filepath}"
+	)
 	return output_filepath
 
 

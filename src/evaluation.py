@@ -100,39 +100,23 @@ def get_class_name(dataset_name: str, class_idx: int) -> str:
 	return f"Class {class_idx}"
 
 
-def _collect_samples(loader: DataLoader, num_samples: int) -> tuple[torch.Tensor, torch.Tensor]:
-	if num_samples < 1:
-		raise ValueError("num_samples must be >= 1")
-
-	image_parts = []
-	label_parts = []
-	collected = 0
-	for images, labels in loader:
-		remaining = num_samples - collected
-		if remaining <= 0:
-			break
-		take = min(remaining, images.size(0))
-		image_parts.append(images[:take])
-		label_parts.append(labels[:take])
-		collected += take
-
-	if not image_parts:
-		raise ValueError("The provided loader is empty")
-	return torch.cat(image_parts, dim=0), torch.cat(label_parts, dim=0)
-
-
 def run_gradcam_pipeline(
 		model: nn.Module,
-		val_loader: DataLoader,
+		loader: DataLoader,
 		dataset_name: str,
 		arch: str,
 		paradigm: str,
 		device: torch.device,
-		num_samples: int = 8,
 		val_fraction: float = CONFIG["val_fraction"],
 		output_name: str | None = None,
 ) -> str:
-	"""Extract batched Grad-CAM and Guided Grad-CAM maps across all 4 stages for test samples."""
+	"""
+	Extract Grad-CAM and Guided Grad-CAM maps across all 4 stages for all loader samples.
+	"""
+
+	if loader is None:
+		raise ValueError("A DataLoader must be provided.")
+
 	model.eval().to(device)
 	backbone = getattr(model, "backbone", model)
 
@@ -141,7 +125,6 @@ def run_gradcam_pipeline(
 		if not hasattr(backbone, stage):
 			raise ValueError(f"Grad-CAM requires backbone stage '{stage}'")
 
-	# Target the last convolutional block of each stage
 	target_layers = [
 		cast(nn.Module, list(getattr(backbone, stage).children())[-1])
 		for stage in stages
@@ -151,40 +134,52 @@ def run_gradcam_pipeline(
 	mean_array = np.array(mean).reshape(1, 3, 1, 1)
 	std_array = np.array(std).reshape(1, 3, 1, 1)
 
-	images_batch, labels_batch = _collect_samples(val_loader, num_samples)
-	inputs = images_batch.to(device)
-	targets = labels_batch.to(device)
-
-	# Guided Backpropagation is computed once at the input level
 	guided_bp = GuidedBackprop(model=model)
-	guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
 
-	# Generate Grad-CAM heatmaps for each layer/stage
-	cam_maps_by_layer: list[np.ndarray] = []
-	for target_layer in target_layers:
-		grad_cam = GradCAM(model=model, target_layer=target_layer)
-		try:
-			cams = grad_cam.generate_cam(inputs, target_class=targets).numpy()
-			cam_maps_by_layer.append(cams)
-		finally:
-			grad_cam.remove_hooks()
+	collected_originals: list[np.ndarray] = []
+	collected_labels: list[int] = []
+	collected_guided: list[np.ndarray] = []
+	collected_cams: list[list[np.ndarray]] = [[] for _ in stages]
 
-	# Denormalize input images for plotting
-	originals = inputs.detach().cpu().numpy() * std_array + mean_array
-	originals = np.clip(originals.transpose(0, 2, 3, 1), 0.0, 1.0)
+	# Process all batches as structured by the DataLoader
+	for images, labels in loader:
+		inputs = images.to(device)
+		targets = labels.to(device)
 
-	# 1 input image column + 2 columns per layer (heatmap, guided) = 9 columns
-	num_samples = inputs.size(0)
+		guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
+		collected_guided.append(guided_grads)
+
+		for stage_idx, target_layer in enumerate(target_layers):
+			grad_cam = GradCAM(model=model, target_layer=target_layer)
+			try:
+				cams = grad_cam.generate_cam(inputs, target_class=targets).numpy()
+				collected_cams[stage_idx].append(cams)
+			finally:
+				grad_cam.remove_hooks()
+
+		orig = inputs.detach().cpu().numpy() * std_array + mean_array
+		orig = np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0)
+		collected_originals.append(orig)
+		collected_labels.extend(labels.tolist())
+
+	if not collected_originals:
+		raise ValueError("The provided DataLoader is empty.")
+
+	originals = np.concatenate(collected_originals, axis=0)
+	guided_grads = np.concatenate(collected_guided, axis=0)
+	cam_maps_by_layer = [np.concatenate(stage_cams, axis=0) for stage_cams in collected_cams]
+
+	total_samples = len(originals)
 	num_cols = 1 + 2 * len(stages)
 	fig, axes = plt.subplots(
-		num_samples,
+		total_samples,
 		num_cols,
-		figsize=(2.8 * num_cols, 2.8 * num_samples),
+		figsize=(2.8 * num_cols, 2.8 * total_samples),
 		squeeze=False,
 	)
 
-	for i in range(num_samples):
-		true_label = int(labels_batch[i])
+	for i in range(total_samples):
+		true_label = int(collected_labels[i])
 		true_label_name = get_class_name(dataset_name, true_label)
 
 		# Col 0: Original input image
@@ -196,7 +191,6 @@ def run_gradcam_pipeline(
 		for stage_idx, stage_name in enumerate(stages):
 			cam = cam_maps_by_layer[stage_idx][i]
 
-			# Fuse guided backprop with layer-specific CAM
 			guided_cam = guided_grads[i] * cam[..., np.newaxis]
 			guided_cam -= guided_cam.mean()
 			guided_cam /= guided_cam.std() + 1e-8
@@ -205,18 +199,16 @@ def run_gradcam_pipeline(
 			col_heatmap = 1 + 2 * stage_idx
 			col_guided = 2 + 2 * stage_idx
 
-			# Grad-CAM Heatmap
 			axes[i, col_heatmap].imshow(cam, cmap="jet")
 			axes[i, col_heatmap].set_title(f"{stage_name}\nHeatmap", fontsize=9)
 			axes[i, col_heatmap].axis("off")
 
-			# Guided Grad-CAM
 			axes[i, col_guided].imshow(guided_cam)
 			axes[i, col_guided].set_title(f"{stage_name}\nGuided CAM", fontsize=9)
 			axes[i, col_guided].axis("off")
 
 	model_id = f"{dataset_name}_{arch}_{paradigm}"
-	output_stem = f"gradcam_multistage_{model_id}"
+	output_stem = f"gradcam_{model_id}"
 	if output_name:
 		output_stem = f"{output_stem}_{output_name}"
 	output_filepath = os.path.join(DIR_OUTPUT, "gradcam", output_stem, f"{output_stem}.png")
@@ -232,43 +224,57 @@ def run_gradcam_pipeline(
 
 def run_GMAR_pipeline(
 		model: nn.Module,
-		val_loader: DataLoader,
+		loader: DataLoader,
 		dataset_name: str,
 		arch: str,
 		paradigm: str,
 		device: torch.device,
-		num_samples: int = 8,
 		val_fraction: float = CONFIG["val_fraction"],
 		output_name: str | None = None,
 ) -> str:
-	"""Extract batched GMAR maps for test samples."""
+	"""Extract GMAR saliency maps for all loader samples."""
+
+	if loader is None:
+		raise ValueError("A DataLoader must be provided.")
+
 	model.eval().to(device)
-	backbone = getattr(model, "backbone", model)
 	gmar = GMAR(model=model)
 
 	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
 	mean_array = np.array(mean).reshape(1, 3, 1, 1)
 	std_array = np.array(std).reshape(1, 3, 1, 1)
 
-	images_batch, labels_batch = _collect_samples(val_loader, num_samples)
-	inputs = images_batch.to(device)
-	targets = labels_batch.to(device)
-	gmar_maps = gmar.generate_saliency_map(
-		inputs,
-		target_category=targets,
-		image_size=inputs.shape[-2:],
-	).cpu().numpy()
+	collected_originals: list[np.ndarray] = []
+	collected_labels: list[int] = []
+	collected_gmar: list[np.ndarray] = []
 
-	originals = inputs.detach().cpu().numpy() * std_array + mean_array
-	originals = np.clip(originals.transpose(0, 2, 3, 1), 0.0, 1.0)
+	for images, labels in loader:
+		inputs = images.to(device)
+		targets = labels.to(device)
 
-	num_samples = inputs.size(0)
-	fig, axes = plt.subplots(num_samples, 2, figsize=(6, 3 * num_samples))
-	if num_samples == 1:
-		axes = np.expand_dims(axes, 0)
+		gmar_maps = gmar.generate_saliency_map(
+			inputs,
+			target_category=targets,
+			image_size=inputs.shape[-2:],
+		).cpu().numpy()
+		collected_gmar.append(gmar_maps)
 
-	for i in range(num_samples):
-		true_label = int(labels_batch[i])
+		orig = inputs.detach().cpu().numpy() * std_array + mean_array
+		orig = np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0)
+		collected_originals.append(orig)
+		collected_labels.extend(labels.tolist())
+
+	if not collected_originals:
+		raise ValueError("The provided DataLoader is empty.")
+
+	originals = np.concatenate(collected_originals, axis=0)
+	gmar_maps = np.concatenate(collected_gmar, axis=0)
+	total_samples = len(originals)
+
+	fig, axes = plt.subplots(total_samples, 2, figsize=(6, 3 * total_samples), squeeze=False)
+
+	for i in range(total_samples):
+		true_label = int(collected_labels[i])
 		true_label_name = get_class_name(dataset_name, true_label)
 
 		axes[i, 0].imshow(originals[i])
@@ -283,12 +289,15 @@ def run_GMAR_pipeline(
 	output_stem = f"gmar_{dataset_name}_{arch}_{paradigm}"
 	if output_name:
 		output_stem = f"{output_stem}_{output_name}"
-	output_filepath = os.path.join(DIR_OUTPUT, f"{output_stem}.png")
+	output_filepath = os.path.join(DIR_OUTPUT, "gmar", f"{output_stem}.png")
+	os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
+
 	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
 	plt.close(fig)
 
 	print(f"[GMAR Complete] Visualizations saved to: {output_filepath}")
 	return output_filepath
+
 
 def evaluate_model(
 		model: nn.Module,

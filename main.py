@@ -4,7 +4,7 @@ import os
 import torch
 import torch.nn as nn
 
-from src.data import get_dataloaders
+from src.data import get_dataloaders, get_balanced_test_loader
 from src.evaluation import evaluate_model, run_GMAR_pipeline, run_gradcam_pipeline
 from src.globals import CONFIG, DATASETS, DEVICE, set_seed
 from src.network import LinearProbeModel, build_model
@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--lejepa_lambda", type=float, default=CONFIG["lejepa_lambda"])
     parser.add_argument("-r", "--resume", action="store_true")
     parser.add_argument("--skip_postprocess", action="store_true")
+    parser.add_argument("--eval-class-samples", type=int, default=1)
     return parser.parse_args()
 
 
@@ -210,18 +211,31 @@ def main():
         return
 
     if args.mode in ("gradcam", "GMAR"):
+
+        # Ensure Grad-CAM with CNN
         if args.mode == "gradcam" and args.arch != "cnn":
             raise ValueError("Grad-CAM requires arch='cnn'.")
+
+        # Ensure GMAR with ViT
         if args.mode == "GMAR" and args.arch != "vit":
             raise ValueError("GMAR requires arch='vit'.")
 
         summary = load_probe_summary(args.dataset, args.arch, args.paradigm)
-        _, _, test_loader = get_dataloaders(
-            args.dataset,
-            args.batch_size,
-            paradigm="std",
+        num_classes = DATASETS[args.dataset]["num_classes"]
+
+        # Determine number of samples to use
+        samples_per_class = args.eval_class_samples if args.eval_class_samples is not None else 1
+        total_samples = samples_per_class * num_classes
+
+        # Deterministic, balanced test loader with interleaved class ordering
+        test_loader, _ = get_balanced_test_loader(
+            dataset_name=args.dataset,
+            samples_per_class=samples_per_class,
+            batch_size=args.batch_size,
+            num_workers=CONFIG["num_workers"],
             val_fraction=args.val_fraction,
-            include_test=True,
+            seed=CONFIG["seed"],
+            interleave=True,
         )
 
         for record in summary["probe_results"]:
@@ -251,7 +265,7 @@ def main():
                 )
 
             backbone = model.backbone if args.paradigm == "lejepa" else model
-            head = nn.Linear(backbone.embed_dim, DATASETS[args.dataset]["num_classes"])
+            head = nn.Linear(backbone.embed_dim, num_classes)
             head.load_state_dict(probe_checkpoint["head_state_dict"])
             probe_model = LinearProbeModel(backbone, head).to(device)
 
@@ -262,7 +276,7 @@ def main():
                 f"[{args.mode}] Epoch {int(record['epoch']):04d} | "
                 f"Val Acc {float(probe_checkpoint['best_val_acc']):.2f}% | "
                 f"Test Acc {float(probe_checkpoint['test_acc']):.2f}% | "
-                f"Relative Acc {relative}"
+                f"Relative Acc {float(relative):.2f}% | Total Samples: {total_samples} ({samples_per_class}/class)"
             )
 
             if args.mode == "gradcam":
@@ -273,7 +287,6 @@ def main():
                     args.arch,
                     args.paradigm,
                     device,
-                    num_samples=8,
                     val_fraction=args.val_fraction,
                     output_name=output_name,
                 )
@@ -285,7 +298,6 @@ def main():
                     args.arch,
                     args.paradigm,
                     device,
-                    num_samples=8,
                     val_fraction=args.val_fraction,
                     output_name=output_name,
                 )

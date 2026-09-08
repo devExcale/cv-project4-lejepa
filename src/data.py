@@ -1,10 +1,11 @@
 import json
 import os
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
+import numpy as np
 import torch
 from datasets import Dataset as HFDataset, load_dataset
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -362,3 +363,105 @@ def get_dataloaders(
         **common_loader,
     )
     return train_loader, val_loader, test_loader
+
+
+def get_balanced_test_indices(
+        dataset_name: str,
+        samples_per_class: int = 50,
+        seed: int = CONFIG["seed"],
+        data_dir: str = DIR_DATA,
+        interleave: bool = False,
+) -> List[int]:
+    """
+    Directly queries the dataset label column to deterministically select
+    an equal number of sample indices per class without reading image data.
+    """
+    if dataset_name not in DATASETS:
+        raise ValueError(f"Unknown dataset '{dataset_name}'")
+
+    meta = DATASETS[dataset_name]
+    label_key = meta["label_key"]
+    num_classes = meta["num_classes"]
+
+    # Loads metadata table from cache_dir; does NOT decode image bytes
+    raw_test = load_dataset(meta["hf_path"], split="test", cache_dir=data_dir)
+    labels = np.asarray(raw_test[label_key])
+
+    # Pinned NumPy generator ensures cross-platform determinism
+    rng = np.random.default_rng(seed)
+    per_class_indices: list[list[int]] = []
+
+    for c in range(num_classes):
+        cls_indices = np.where(labels == c)[0]
+        if len(cls_indices) < samples_per_class:
+            raise ValueError(
+                f"Class {c} has only {len(cls_indices)} samples, "
+                f"but {samples_per_class} were requested."
+            )
+        # Deterministically permute and take the first N samples
+        perm = rng.permutation(cls_indices)
+        per_class_indices.append(perm[:samples_per_class].tolist())
+
+    if interleave:
+        # Round-robin: [c0_0, c1_0, ..., c9_0, c0_1, c1_1, ...]
+        # Useful if evaluating mini-batches with uniform class distribution
+        indices = [
+            idx
+            for sample_group in zip(*per_class_indices)
+            for idx in sample_group
+        ]
+    else:
+        # Grouped: [c0_0..c0_49, c1_0..c1_49, ...]
+        indices = [idx for cls_list in per_class_indices for idx in cls_list]
+
+    return indices
+
+
+def get_balanced_test_loader(
+        dataset_name: str,
+        samples_per_class: int = 50,
+        batch_size: int = CONFIG["batch_size"],
+        num_workers: int = CONFIG["num_workers"],
+        data_dir: str = DIR_DATA,
+        val_fraction: float = CONFIG["val_fraction"],
+        seed: int = CONFIG["seed"],
+        interleave: bool = False,
+) -> Tuple[DataLoader, List[int]]:
+    """
+    Creates a deterministic DataLoader containing exactly (samples_per_class * num_classes)
+    images evaluated on identical validation/test transforms.
+    """
+
+    indices = get_balanced_test_indices(
+        dataset_name=dataset_name,
+        samples_per_class=samples_per_class,
+        seed=seed,
+        data_dir=data_dir,
+        interleave=interleave,
+    )
+
+    _, eval_transform = get_transforms(
+        dataset_name,
+        val_fraction=val_fraction,
+        seed=seed,
+        data_dir=data_dir,
+    )
+
+    full_test_dataset = HuggingFaceDataset(
+        dataset_name=dataset_name,
+        split="test",
+        transform=eval_transform,
+        data_dir=data_dir,
+    )
+
+    subset = Subset(full_test_dataset, indices)
+
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+    )
+    return loader, indices

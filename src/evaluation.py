@@ -101,6 +101,92 @@ def get_class_name(dataset_name: str, class_idx: int) -> str:
 	return f"Class {class_idx}"
 
 
+def _save_saliency_pdf(
+		output_filepath: str,
+		originals: np.ndarray,
+		labels: list[int],
+		preds: list[int],
+		dataset_name: str,
+		heatmaps_by_layer: list[np.ndarray],
+		layer_names: list[str],
+		guided_grads: np.ndarray | None = None,
+		method_name: str = "CAM",
+):
+	"""
+	Internal helper to render multi-column PDF previews with correctness status.
+	"""
+
+	total_samples = len(originals)
+	if total_samples == 0:
+		return
+
+	num_layers = len(layer_names)
+	has_guided = guided_grads is not None
+	# 1 column for original; 2 per layer if guided is present, else 1 per layer
+	num_cols = 1 + (2 * num_layers if has_guided else num_layers)
+
+	fig, axes = plt.subplots(
+		total_samples,
+		num_cols,
+		figsize=(2.6 * num_cols, 2.8 * total_samples),
+		squeeze=False,
+	)
+
+	for i in range(total_samples):
+		true_label = int(labels[i])
+		pred_label = int(preds[i])
+		true_label_name = get_class_name(dataset_name, true_label)
+		pred_label_name = get_class_name(dataset_name, pred_label)
+		is_correct = (pred_label == true_label)
+
+		# Status badge formatting
+		status_tag = "[CORRECT]" if is_correct else f"[MISS: Pred {pred_label_name}]"
+		status_color = "darkgreen" if is_correct else "crimson"
+
+		# Column 0: Original input image
+		axes[i, 0].imshow(originals[i])
+		axes[i, 0].set_title(
+			f"Sample {i + 1}: {true_label_name}\n{status_tag}",
+			fontsize=8,
+			fontweight="bold",
+			color=status_color,
+		)
+		axes[i, 0].axis("off")
+
+		# Layer-wise attributions
+		for l_idx, layer_name in enumerate(layer_names):
+			cam = heatmaps_by_layer[l_idx][i]
+
+			if has_guided:
+				col_heat = 1 + 2 * l_idx
+				col_guided = 2 + 2 * l_idx
+
+				# Heatmap
+				axes[i, col_heat].imshow(cam, cmap="jet")
+				axes[i, col_heat].set_title(f"{layer_name}\nHeatmap", fontsize=8)
+				axes[i, col_heat].axis("off")
+
+				# Guided overlay
+				guided = guided_grads[i] * cam[..., np.newaxis]
+				guided -= guided.mean()
+				guided /= (guided.std() + 1e-8)
+				guided = np.clip(guided * 0.15 + 0.5, 0.0, 1.0)
+
+				axes[i, col_guided].imshow(guided)
+				axes[i, col_guided].set_title(f"{layer_name}\nGuided {method_name}", fontsize=8)
+				axes[i, col_guided].axis("off")
+			else:
+				col_heat = 1 + l_idx
+				axes[i, col_heat].imshow(cam, cmap="jet")
+				axes[i, col_heat].set_title(f"{layer_name}\n{method_name}", fontsize=8)
+				axes[i, col_heat].axis("off")
+
+	plt.tight_layout()
+	os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
+	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
+	plt.close(fig)
+
+
 def run_gradcam_pipeline(
 		model: nn.Module,
 		loader: DataLoader,
@@ -112,9 +198,10 @@ def run_gradcam_pipeline(
 		output_name: str | None = None,
 		plot: bool = True,
 		resume: bool = True,
+		split_by_correct: bool = False,
 ) -> str:
 	"""
-	Extract Grad-CAM maps across all 4 stages for all samples in the loader.
+	Extract Grad-CAM maps across all 4 stages with correct/miss sample labels.
 	"""
 
 	if loader is None:
@@ -155,10 +242,7 @@ def run_gradcam_pipeline(
 			for b in range(batch_size):
 				true_label = int(labels[b])
 				point_idx = class_counters.get(true_label, 0)
-				ds_point = f"c{true_label}_{point_idx}"
-				filename = f"{output_stem}_{ds_point}.pt"
-				filepath = os.path.join(output_dir, filename)
-
+				filepath = os.path.join(output_dir, f"{output_stem}_c{true_label}_{point_idx}.pt")
 				sample_filepaths.append(filepath)
 				class_counters[true_label] = point_idx + 1
 
@@ -175,7 +259,7 @@ def run_gradcam_pipeline(
 			sub_inputs = images[needed_indices].to(device)
 			sub_targets = labels[needed_indices].to(device)
 
-			batch_cams: list[torch.Tensor] = []
+			batch_cams = []
 			for target_layer in target_layers:
 				grad_cam = GradCAM(model=model, target_layer=target_layer)
 				try:
@@ -192,10 +276,7 @@ def run_gradcam_pipeline(
 				torch.save(stacked_cams[idx], sample_filepaths[b])
 				total_saved += 1
 
-		print(
-			f"[Grad-CAM] Directory: {output_dir} | "
-			f"Saved: {total_saved} new | Skipped: {total_skipped} existing"
-		)
+		print(f"[Grad-CAM] Directory: {output_dir} | Saved: {total_saved} new | Skipped: {total_skipped} existing")
 		return output_dir
 
 	# --- Preview plot (gradcam heatmaps + guided backprop) ---
@@ -209,79 +290,51 @@ def run_gradcam_pipeline(
 	std_array = np.array(std).reshape(1, 3, 1, 1)
 
 	guided_bp = GuidedBackprop(model=model)
-
-	collected_originals: list[np.ndarray] = []
-	collected_labels: list[int] = []
-	collected_guided: list[np.ndarray] = []
-	collected_cams: list[list[np.ndarray]] = [[] for _ in stages]
+	collected_originals, collected_labels, collected_preds = [], [], []
+	collected_guided, collected_cams = [], [[] for _ in stages]
 
 	for images, labels in loader:
 		inputs = images.to(device)
 		targets = labels.to(device)
 
+		# 1. Capture model predictions for correctness badges
+		with torch.no_grad():
+			preds = model(inputs).argmax(dim=-1)
+		collected_preds.extend(preds.cpu().tolist())
+
+		# 2. Guided Backprop & Stage Grad-CAMs
 		guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
 		collected_guided.append(guided_grads)
 
 		for stage_idx, target_layer in enumerate(target_layers):
 			grad_cam = GradCAM(model=model, target_layer=target_layer)
 			try:
-				cams = grad_cam.generate_cam(inputs, target_class=targets).numpy()
-				collected_cams[stage_idx].append(cams)
+				collected_cams[stage_idx].append(grad_cam.generate_cam(inputs, target_class=targets).numpy())
 			finally:
 				grad_cam.remove_hooks()
 
 		orig = inputs.detach().cpu().numpy() * std_array + mean_array
-		orig = np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0)
-		collected_originals.append(orig)
+		collected_originals.append(np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0))
 		collected_labels.extend(labels.tolist())
 
 	originals = np.concatenate(collected_originals, axis=0)
-	guided_grads = np.concatenate(collected_guided, axis=0)
-	cam_maps_by_layer = [np.concatenate(stage_cams, axis=0) for stage_cams in collected_cams]
+	all_guided = np.concatenate(collected_guided, axis=0)
+	cams_by_stage = [np.concatenate(stage_cams, axis=0) for stage_cams in collected_cams]
 
-	total_samples = len(originals)
-	num_cols = 1 + 2 * len(stages)
-	fig, axes = plt.subplots(
-		total_samples,
-		num_cols,
-		figsize=(2.8 * num_cols, 2.8 * total_samples),
-		squeeze=False,
+	# Render main PDF
+	_save_saliency_pdf(
+		output_filepath=output_filepath,
+		originals=originals,
+		labels=collected_labels,
+		preds=collected_preds,
+		dataset_name=dataset_name,
+		heatmaps_by_layer=cams_by_stage,
+		layer_names=stages,
+		guided_grads=all_guided,
+		method_name="CAM",
 	)
-
-	for i in range(total_samples):
-		true_label = int(collected_labels[i])
-		true_label_name = get_class_name(dataset_name, true_label)
-
-		# Col 0: Original input image
-		axes[i, 0].imshow(originals[i])
-		axes[i, 0].set_title(f"Sample {i + 1}\n({true_label_name})", fontsize=9)
-		axes[i, 0].axis("off")
-
-		# Interleave heatmap and guided Grad-CAM for each layer
-		for stage_idx, stage_name in enumerate(stages):
-			cam = cam_maps_by_layer[stage_idx][i]
-
-			guided_cam = guided_grads[i] * cam[..., np.newaxis]
-			guided_cam -= guided_cam.mean()
-			guided_cam /= guided_cam.std() + 1e-8
-			guided_cam = np.clip(guided_cam * 0.15 + 0.5, 0.0, 1.0)
-
-			col_heatmap = 1 + 2 * stage_idx
-			col_guided = 2 + 2 * stage_idx
-
-			axes[i, col_heatmap].imshow(cam, cmap="jet")
-			axes[i, col_heatmap].set_title(f"{stage_name}\nHeatmap", fontsize=9)
-			axes[i, col_heatmap].axis("off")
-
-			axes[i, col_guided].imshow(guided_cam)
-			axes[i, col_guided].set_title(f"{stage_name}\nGuided CAM", fontsize=9)
-			axes[i, col_guided].axis("off")
-
-	plt.tight_layout()
-	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
-	plt.close(fig)
-
 	print(f"[Grad-CAM Complete] Visualizations saved to: {output_filepath}")
+
 	return output_filepath
 
 
@@ -298,7 +351,7 @@ def run_gmar_pipeline(
 		resume: bool = True,
 ) -> str:
 	"""
-	Extract GMAR saliency heatmaps and Guided GMAR across all 6 transformer blocks.
+	Extract GMAR saliency heatmaps across all 6 blocks with correct/miss sample labels.
 	"""
 
 	if loader is None:
@@ -335,10 +388,7 @@ def run_gmar_pipeline(
 			for b in range(batch_size):
 				true_label = int(labels[b])
 				point_idx = class_counters.get(true_label, 0)
-				ds_point = f"c{true_label}_{point_idx}"
-				filename = f"{output_stem}_{ds_point}.pt"
-				filepath = os.path.join(output_dir, filename)
-
+				filepath = os.path.join(output_dir, f"{output_stem}_c{true_label}_{point_idx}.pt")
 				sample_filepaths.append(filepath)
 				class_counters[true_label] = point_idx + 1
 
@@ -382,21 +432,22 @@ def run_gmar_pipeline(
 	std_array = np.array(std).reshape(1, 3, 1, 1)
 
 	guided_bp = GuidedBackprop(model=model)
-
-	collected_originals: list[np.ndarray] = []
-	collected_labels: list[int] = []
-	collected_guided: list[np.ndarray] = []
-	collected_maps: list[np.ndarray] = []
+	collected_originals, collected_labels, collected_preds = [], [], []
+	collected_guided, collected_maps = [], []
 
 	for images, labels in loader:
 		inputs = images.to(device)
 		targets = labels.to(device)
 
-		# 1. Compute pixel-level Guided Backprop
+		# 1. Capture model predictions for correctness badges
+		with torch.no_grad():
+			preds = model(inputs).argmax(dim=-1)
+		collected_preds.extend(preds.cpu().tolist())
+
+		# 2. Guided Backprop & 6-block GMAR rollout
 		guided_grads = guided_bp.generate_gradients(inputs, target_class=targets)
 		collected_guided.append(guided_grads)
 
-		# 2. Compute GMAR heatmaps across all 6 blocks [B, 32, 32, 6]
 		batch_maps = compute_gmar_block_heatmaps(
 			model=model,
 			inputs=inputs,
@@ -407,61 +458,28 @@ def run_gmar_pipeline(
 
 		# De-normalize inputs for plotting
 		orig = inputs.detach().cpu().numpy() * std_array + mean_array
-		orig = np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0)
-		collected_originals.append(orig)
+		collected_originals.append(np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0))
 		collected_labels.extend(labels.tolist())
 
 	originals = np.concatenate(collected_originals, axis=0)
-	guided_grads = np.concatenate(collected_guided, axis=0)
-	all_gmar_maps = np.concatenate(collected_maps, axis=0)  # [N, 32, 32, 6]
-	total_samples = len(originals)
+	all_guided = np.concatenate(collected_guided, axis=0)
+	all_gmar_maps = np.concatenate(collected_maps, axis=0)  # [Total, 32, 32, 6]
+	gmar_by_block = [all_gmar_maps[:, :, :, b] for b in range(num_blocks)]
 
-	# 1 column for original + 2 columns per block (Heatmap + Guided GMAR)
-	num_cols = 1 + 2 * num_blocks
-	fig, axes = plt.subplots(
-		total_samples,
-		num_cols,
-		figsize=(2.5 * num_cols, 2.8 * total_samples),
-		squeeze=False,
+	# Render main PDF
+	_save_saliency_pdf(
+		output_filepath=output_filepath,
+		originals=originals,
+		labels=collected_labels,
+		preds=collected_preds,
+		dataset_name=dataset_name,
+		heatmaps_by_layer=gmar_by_block,
+		layer_names=block_names,
+		guided_grads=all_guided,
+		method_name="GMAR",
 	)
-
-	for i in range(total_samples):
-		true_label = int(collected_labels[i])
-		true_label_name = get_class_name(dataset_name, true_label)
-
-		# Col 0: Original input image
-		axes[i, 0].imshow(originals[i])
-		axes[i, 0].set_title(f"Sample {i + 1}\n({true_label_name})", fontsize=9)
-		axes[i, 0].axis("off")
-
-		# Interleave Heatmap and Guided GMAR for each block
-		for block_idx in range(num_blocks):
-			cam = all_gmar_maps[i, :, :, block_idx]
-
-			# Pointwise product between pixel-gradients and attention rollout heatmap
-			guided_gmar = guided_grads[i] * cam[..., np.newaxis]
-			guided_gmar -= guided_gmar.mean()
-			guided_gmar /= guided_gmar.std() + 1e-8
-			guided_gmar = np.clip(guided_gmar * 0.15 + 0.5, 0.0, 1.0)
-
-			col_heatmap = 1 + 2 * block_idx
-			col_guided = 2 + 2 * block_idx
-
-			# GMAR Rollout Heatmap
-			axes[i, col_heatmap].imshow(cam, cmap="jet")
-			axes[i, col_heatmap].set_title(f"{block_names[block_idx]}\nRollout", fontsize=8)
-			axes[i, col_heatmap].axis("off")
-
-			# Guided GMAR
-			axes[i, col_guided].imshow(guided_gmar)
-			axes[i, col_guided].set_title(f"{block_names[block_idx]}\nGuided GMAR", fontsize=8)
-			axes[i, col_guided].axis("off")
-
-	plt.tight_layout()
-	fig.savefig(output_filepath, dpi=300, bbox_inches="tight")
-	plt.close(fig)
-
 	print(f"[GMAR Complete] Visualizations saved to: {output_filepath}")
+
 	return output_filepath
 
 

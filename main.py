@@ -9,7 +9,7 @@ from src.evaluation import (
     evaluate_model,
     run_gmar_pipeline,
     run_gradcam_pipeline,
-    run_pca_pipeline,
+    run_pca_pipeline, run_sas_pipeline,
 )
 
 from src.globals import CONFIG, DATASETS, DEVICE, set_seed
@@ -37,6 +37,7 @@ def parse_args():
             "pca",
             "gradcam",
             "gmar",
+            "sas",
             "test_cuda",
             "test_config",
             "test_pipeline",
@@ -328,7 +329,24 @@ def main():
             del probe_model, model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
         return
+
+    if args.mode == "sas":
+
+        if args.epoch is None:
+            raise ValueError("Mode 'sas' requires the '--epoch' argument (e.g., --epoch 100).")
+
+        run_sas_pipeline(
+            dataset_name=args.dataset,
+            arch=args.arch,
+            paradigm=args.paradigm,
+            epoch=args.epoch,
+            device=device,
+        )
+        return
+
+    return
 
 
 if __name__ == "__main__":

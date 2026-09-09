@@ -270,178 +270,169 @@ class GMAR:
 		return saliency_map.detach()
 
 
-
 class SAS:
-    '''Semantic Alignment Score (SAS) tra Mappe XAI e Mappe Semantiche PCA.'''
-    def __init__(self, num_bins: int = 16, threshold: float = 0.8):
-        '''
-        Args:
-            num_bins (int): Numero di bin per la quantizzazione nell'Informazione Mutua.
-            threshold (float): Soglia per la binarizzazione delle mappe di saliency.
-        '''
-        self.num_bins = num_bins
-        self.threshold = threshold
-        self.metrics_funct = {
-            "jaccard": self.jaccard_index,
-            "mse": self.MSE,
-            "mae": self.MAE,
-            "pearson": self.pearson_correlation,
-            "spearman": self.spearman_correlation,
-            "mi": self.mutual_information
-        }
-        self.metrics_list = list(self.metrics_funct.keys())
+	'''Semantic Alignment Score (SAS) tra Mappe XAI e Mappe Semantiche PCA.'''
 
-    def compute_sas(self, XAI_sal_map: torch.Tensor, PCA_sem_map: torch.Tensor) -> dict[str, torch.Tensor]:
-        """
-        Calcola il Semantic Alignment Score per un'immagine singola [C, H, W] o un batch [B, C, H, W].
-        
-        Args:
-            XAI_sal_map (torch.Tensor): Forma [C, H, W] oppure [B, C, H, W]
-            PCA_sem_map (torch.Tensor): Forma [C, H, W] oppure [B, C, H, W]
-        Returns:
-            tensori di forma [C] (se input 3D) o [B, C] (se input 4D).
-        """
-        is_single_image = (XAI_sal_map.ndim == 3) # image plus layers
+	def __init__(self, num_bins: int = 16, threshold: float = 0.8):
+		'''
+		Args:
+			num_bins (int): Numero di bin per la quantizzazione nell'Informazione Mutua.
+			threshold (float): Soglia per la binarizzazione delle mappe di saliency.
+		'''
+		self.num_bins = num_bins
+		self.threshold = threshold
+		self.metrics_funct = {
+			"jaccard": self.jaccard_index,
+			"mse": self.MSE,
+			"mae": self.MAE,
+			"pearson": self.pearson_correlation,
+			"spearman": self.spearman_correlation,
+			"mi": self.mutual_information
+		}
+		self.metrics_list = list(self.metrics_funct.keys())
 
-        # 1. Se l'input è [C, H, W], aggiungiamo la dimensione di Batch -> [1, C, H, W]
-        if is_single_image:
-            xai = XAI_sal_map.unsqueeze(0)
-            pca = PCA_sem_map.unsqueeze(0)
-        else:
-            xai = XAI_sal_map
-            pca = PCA_sem_map
+	def compute_sas(self, XAI_sal_map: torch.Tensor, PCA_sem_map: torch.Tensor) -> tuple[
+		torch.Tensor, dict[str, torch.Tensor]]:
+		"""
+		Calcola il Semantic Alignment Score per un'immagine singola [C, H, W] o un batch [B, C, H, W].
+		"""
+		is_single_image = (XAI_sal_map.ndim == 3)
 
-        # 3. Appiattiamo solo le dimensioni spaziali -> [B, C, HxW]
-        xai_flat = xai.flatten(start_dim=2)
-        pca_flat = pca.flatten(start_dim=2)
+		if is_single_image:
+			xai = XAI_sal_map.unsqueeze(0)
+			pca = PCA_sem_map.unsqueeze(0)
+		else:
+			xai = XAI_sal_map
+			pca = PCA_sem_map
 
-        # 4. Calcoliamo tutte le metriche
-        metrics_dict = {}
-        for metric in metrics_list:
-            metrics_dict[metric] = self.metrics_funct[metric](xai_flat, pca_flat)
+		xai_flat = xai.flatten(start_dim=2)
+		pca_flat = pca.flatten(start_dim=2)
 
-        metrics = torch.stack(list(metrics_dict.values()), dim=2)  # [B, C, M]
+		metrics_dict = {}
+		# Fixed: access via self.metrics_list
+		for metric in self.metrics_list:
+			metrics_dict[metric] = self.metrics_funct[metric](xai_flat, pca_flat)
 
-        # 5. Se l'input era un'immagine singola, rimuoviamo la dimensione di Batch temporanea
-        # Output finale: tensori di forma [C] (un punteggio per ogni canale/layer del modello)
-        if is_single_image:
-            metrics = metrics.squeeze(0) 
+		metrics = torch.stack(list(metrics_dict.values()), dim=2)  # [B, C, M]
 
-        return metrics, metrics_dict
+		if is_single_image:
+			metrics = metrics.squeeze(0)
 
-    def jaccard_index(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
-        '''Jaccard Index (IoU) vettoriale lungo la dimensione spaziale. Restituisce [B, C].'''
+		return metrics, metrics_dict
 
-        xai_b = (XAI_flat > self.threshold).float()
-        pca_b = (PCA_flat > self.threshold).float()
-        intersection = torch.sum(xai_b * pca_b, dim=-1)
-        union = torch.sum(xai_b, dim=-1) + torch.sum(pca_b, dim=-1) - intersection
-        return intersection / (union + 1e-8)
+	def jaccard_index(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
+		'''Jaccard Index (IoU) vettoriale lungo la dimensione spaziale. Restituisce [B, C].'''
 
-    def MSE(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
-        '''Mean Squared Error (MSE) vettoriale. Restituisce [B, C]. Non utile ma fa nulla'''
-        return torch.mean((XAI_flat - PCA_flat) ** 2, dim=-1)
+		xai_b = (XAI_flat > self.threshold).float()
+		pca_b = (PCA_flat > self.threshold).float()
+		intersection = torch.sum(xai_b * pca_b, dim=-1)
+		union = torch.sum(xai_b, dim=-1) + torch.sum(pca_b, dim=-1) - intersection
+		return intersection / (union + 1e-8)
 
-    def MAE(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
-        '''Mean Absolute Error (MAE) vettoriale. Restituisce [B, C]. Non utile ma fa nulla'''
-        return torch.mean(torch.abs(XAI_flat - PCA_flat), dim=-1)
+	def MSE(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
+		'''Mean Squared Error (MSE) vettoriale. Restituisce [B, C]. Non utile ma fa nulla'''
+		return torch.mean((XAI_flat - PCA_flat) ** 2, dim=-1)
 
-    def pearson_correlation(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
-        '''Correlazione di Pearson vettoriale lungo la dimensione spaziale. Restituisce [B, C].'''
-        xai_mean = torch.mean(XAI_flat, dim=-1, keepdim=True)
-        pca_mean = torch.mean(PCA_flat, dim=-1, keepdim=True)
+	def MAE(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
+		'''Mean Absolute Error (MAE) vettoriale. Restituisce [B, C]. Non utile ma fa nulla'''
+		return torch.mean(torch.abs(XAI_flat - PCA_flat), dim=-1)
 
-        xai_dev = XAI_flat - xai_mean
-        pca_dev = PCA_flat - pca_mean
+	def pearson_correlation(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
+		'''Correlazione di Pearson vettoriale lungo la dimensione spaziale. Restituisce [B, C].'''
+		xai_mean = torch.mean(XAI_flat, dim=-1, keepdim=True)
+		pca_mean = torch.mean(PCA_flat, dim=-1, keepdim=True)
 
-        cov = torch.sum(xai_dev * pca_dev, dim=-1)
-        var_xai = torch.sum(xai_dev ** 2, dim=-1)
-        var_pca = torch.sum(pca_dev ** 2, dim=-1)
+		xai_dev = XAI_flat - xai_mean
+		pca_dev = PCA_flat - pca_mean
 
-        return cov / (torch.sqrt(var_xai * var_pca) + 1e-8)
+		cov = torch.sum(xai_dev * pca_dev, dim=-1)
+		var_xai = torch.sum(xai_dev ** 2, dim=-1)
+		var_pca = torch.sum(pca_dev ** 2, dim=-1)
 
-    def spearman_correlation(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
-        '''Correlazione di Spearman vettoriale (Pearson sui Ranghi). Restituisce [B, C].'''
-        xai_rank = torch.argsort(torch.argsort(XAI_flat, dim=-1), dim=-1).float() # we dont know what to do with ties
-        pca_rank = torch.argsort(torch.argsort(PCA_flat, dim=-1), dim=-1).float() # we dont know what to do with ties
+		return cov / (torch.sqrt(var_xai * var_pca) + 1e-8)
 
-        return self.pearson_correlation(xai_rank, pca_rank)
+	def spearman_correlation(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor) -> torch.Tensor:
+		'''Correlazione di Spearman vettoriale (Pearson sui Ranghi). Restituisce [B, C].'''
+		xai_rank = torch.argsort(torch.argsort(XAI_flat, dim=-1), dim=-1).float()  # we dont know what to do with ties
+		pca_rank = torch.argsort(torch.argsort(PCA_flat, dim=-1), dim=-1).float()  # we dont know what to do with ties
 
-    def mutual_information(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor, num_bins: int = 16) -> torch.Tensor:
-        '''Informazione Mutua Vettoriale tramite Istogramma Congiunto One-Hot. Restituisce [B, C].'''
-        B, C, N = XAI_flat.shape
+		return self.pearson_correlation(xai_rank, pca_rank)
 
-        # 1. Discretizzazione nei bin [0, num_bins - 1]
-        xai_bin = (XAI_flat * (num_bins - 1e-5)).clamp(0, num_bins - 1).long() #range [0, 1] allegedly
-        pca_bin = (PCA_flat * (num_bins - 1e-5)).clamp(0, num_bins - 1).long() #range [0, 1] allegedly
+	def mutual_information(self, XAI_flat: torch.Tensor, PCA_flat: torch.Tensor, num_bins: int = 16) -> torch.Tensor:
+		'''Informazione Mutua Vettoriale tramite Istogramma Congiunto One-Hot. Restituisce [B, C].'''
+		B, C, N = XAI_flat.shape
 
-        # 2. Indice congiunto
-        joint_bin = xai_bin * num_bins + pca_bin
+		# 1. Discretizzazione nei bin [0, num_bins - 1]
+		xai_bin = (XAI_flat * (num_bins - 1e-5)).clamp(0, num_bins - 1).long()  # range [0, 1] allegedly
+		pca_bin = (PCA_flat * (num_bins - 1e-5)).clamp(0, num_bins - 1).long()  # range [0, 1] allegedly
 
-        # 3. Istogramma congiunto vettoriale con One-Hot Encoding
-        one_hot = F.one_hot(joint_bin, num_classes=num_bins**2).float()
-        joint_hist = one_hot.sum(dim=2)
+		# 2. Indice congiunto
+		joint_bin = xai_bin * num_bins + pca_bin
 
-        # 4. Probabilità congiunta e marginali
-        joint_prob = (joint_hist / N).view(B, C, num_bins, num_bins)
-        xai_marg = joint_prob.sum(dim=-1, keepdim=True)
-        pca_marg = joint_prob.sum(dim=-2, keepdim=True)
+		# 3. Istogramma congiunto vettoriale con One-Hot Encoding
+		one_hot = F.one_hot(joint_bin, num_classes=num_bins ** 2).float()
+		joint_hist = one_hot.sum(dim=2)
 
-        p_x_p_y = xai_marg * pca_marg
+		# 4. Probabilità congiunta e marginali
+		joint_prob = (joint_hist / N).view(B, C, num_bins, num_bins)
+		xai_marg = joint_prob.sum(dim=-1, keepdim=True)
+		pca_marg = joint_prob.sum(dim=-2, keepdim=True)
 
-        # 5. Calcolo MI
-        ratio = (joint_prob / (p_x_p_y + 1e-12)).clamp(min=1e-12)
-        mi = torch.sum(joint_prob * torch.log(ratio), dim=(-2, -1))
+		p_x_p_y = xai_marg * pca_marg
 
-        return mi
+		# 5. Calcolo MI
+		ratio = (joint_prob / (p_x_p_y + 1e-12)).clamp(min=1e-12)
+		mi = torch.sum(joint_prob * torch.log(ratio), dim=(-2, -1))
 
-    def compute_metric_agreement(self, sas_results: torch.Tensor) -> tuple[torch.Tensor, list[str]]:
-        """
-        Calcola la matrice di correlazione di Pearson TRA le M metriche,
-        calcolata separatamente PER OGNI LAYER (canale C) lungo il batch B.
+		return mi
 
-        Args:
-            sas_results (torch.Tensor): Tensore di forma [B, C, M] 
-                                        (Batch, Layer/Canali, Metriche).
+	def compute_metrics_agreement(self, sas_results: torch.Tensor) -> tuple[torch.Tensor, list[str]]:
+		"""
+		Calcola la matrice di correlazione di Pearson TRA le M metriche,
+		calcolata separatamente PER OGNI LAYER (canale C) lungo il batch B.
 
-        Returns:
-            corr_matrix (torch.Tensor): Forma [C, M, M] (matrice MxM per ogni canale C).
-            metric_names (list[str]): Nomi delle M metriche ordinate.
-        """
-        if sas_results.ndim == 2:  # Caso in cui è stata usata un'unica immagine [C, M]
-            raise ValueError(
-                "Impossibile calcolare la correlazione su un'unica immagine (B=1). "
-                "Per la correlazione serve un batch con B >= 2 immagini (forma [B, C, M])."
-            )
+		Args:
+			sas_results (torch.Tensor): Tensore di forma [B, C, M]
+										(Batch, Layer/Canali, Metriche).
 
-        B, C, M = sas_results.shape
-        if B < 2:
-            raise ValueError(f"Servono almeno 2 immagini nel batch per la correlazione (ricevuto B={B}).")
+		Returns:
+			corr_matrix (torch.Tensor): Forma [C, M, M] (matrice MxM per ogni canale C).
+			metric_names (list[str]): Nomi delle M metriche ordinate.
+		"""
+		if sas_results.ndim == 2:  # Caso in cui è stata usata un'unica immagine [C, M]
+			raise ValueError(
+				"Impossibile calcolare la correlazione su un'unica immagine (B=1). "
+				"Per la correlazione serve un batch con B >= 2 immagini (forma [B, C, M])."
+			)
 
-        # 1. Centriamo i dati rispetto alla dimensione del batch (B) -> [B, C, M]
-        mean = torch.mean(sas_results, dim=0, keepdim=True)  # [1, C, M]
-        zero_mean = sas_results - mean                      # [B, C, M]
+		B, C, M = sas_results.shape
+		if B < 2:
+			raise ValueError(f"Servono almeno 2 immagini nel batch per la correlazione (ricevuto B={B}).")
 
-        # 2. Riordiniamo le dimensioni per isolare i canali C -> [C, M, B]
-        zero_mean_perm = zero_mean.permute(1, 2, 0)         # [C, M, B]
+		# 1. Centriamo i dati rispetto alla dimensione del batch (B) -> [B, C, M]
+		mean = torch.mean(sas_results, dim=0, keepdim=True)  # [1, C, M]
+		zero_mean = sas_results - mean  # [B, C, M]
 
-        # 3. Calcolo Covarianza per ogni canale: [C, M, B] x [C, B, M] -> [C, M, M]
-        cov = torch.matmul(zero_mean_perm, zero_mean_perm.transpose(1, 2)) / (B - 1 + 1e-8)
+		# 2. Riordiniamo le dimensioni per isolare i canali C -> [C, M, B]
+		zero_mean_perm = zero_mean.permute(1, 2, 0)  # [C, M, B]
 
-        # 4. Deviazione Standard per ogni metrica lungo B -> [C, M]
-        std = torch.std(sas_results, dim=0) 
+		# 3. Calcolo Covarianza per ogni canale: [C, M, B] x [C, B, M] -> [C, M, M]
+		cov = torch.matmul(zero_mean_perm, zero_mean_perm.transpose(1, 2)) / (B - 1 + 1e-8)
 
-        # 5. Matrice dei prodotti delle deviazioni standard -> [C, M, M]
-        # [C, M, 1] * [C, 1, M] mediante broadcasting -> [C, M, M]
-        std_matrix = std.unsqueeze(2) * std.unsqueeze(1) 
+		# 4. Deviazione Standard per ogni metrica lungo B -> [C, M]
+		std = torch.std(sas_results, dim=0)
 
-        # 6. Matrice di Correlazione [C, M, M]
-        corr_matrix = cov / (std_matrix + 1e-8)
+		# 5. Matrice dei prodotti delle deviazioni standard -> [C, M, M]
+		# [C, M, 1] * [C, 1, M] mediante broadcasting -> [C, M, M]
+		std_matrix = std.unsqueeze(2) * std.unsqueeze(1)
 
-        # Clamp per evitare errori di precisione numerica float32 fuori da [-1, 1]
-        corr_matrix = torch.clamp(corr_matrix, -1.0, 1.0)
+		# 6. Matrice di Correlazione [C, M, M]
+		corr_matrix = cov / (std_matrix + 1e-8)
 
-        return corr_matrix, self.metrics_list
+		# Clamp per evitare errori di precisione numerica float32 fuori da [-1, 1]
+		corr_matrix = torch.clamp(corr_matrix, -1.0, 1.0)
+
+		return corr_matrix, self.metrics_list
 
 
 

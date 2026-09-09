@@ -14,10 +14,10 @@ from matplotlib.backends.backend_pdf import PdfPages
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from src.data import get_or_compute_stats, get_dataloaders
+from src.data import get_or_compute_stats, get_dataloaders, _find_model_output_dir, get_correct_heatmap_batches
 from src.globals import CONFIG, DATASETS, DIR_DATA, DIR_OUTPUT
 from src.network import LinearProbeModel, build_model
-from src.utils import GradCAM, GuidedBackprop, GMAR
+from src.utils import GradCAM, GuidedBackprop, GMAR, SAS
 
 
 def spatial_pca(feature_map: torch.Tensor, k: int = 3, image_index: int = 0) -> torch.Tensor:
@@ -1419,3 +1419,108 @@ def run_pca_for_all_checkpoints(
 			plot=plot,
 		))
 	return outputs
+
+
+def run_sas_pipeline(
+		dataset_name: str,
+		arch: str,
+		paradigm: str,
+		epoch: int,
+		device: torch.device | str = "cpu",
+		other_epoch: int | None = None,
+		output_dir: str = DIR_OUTPUT,
+) -> str:
+	"""
+	Computes SAS and metric agreement for the intersection of correctly classified samples.
+	Saves aggregated metrics to output/sas/sas_{full_model_id}.json.
+	"""
+	# 1. Resolve full_model_id from the XAI output directory
+	xai_method = "gradcam" if arch in ("cnn", "resnet") else "gmar"
+	try:
+		_, full_model_id = _find_model_output_dir(
+			xai_method, dataset_name, arch, paradigm, epoch, output_dir
+		)
+	except FileNotFoundError:
+		full_model_id = f"{dataset_name}_{arch}_{paradigm}_epoch_{epoch:04d}"
+
+	print(f"\n[SAS Pipeline] Initializing for model: {full_model_id}")
+
+	# 2. Retrieve intersection of correctly classified batches: [B, C, 32, 32]
+	batch_xai, batch_pca = get_correct_heatmap_batches(
+		dataset_name=dataset_name,
+		arch=arch,
+		paradigm=paradigm,
+		epoch=epoch,
+		other_epoch=other_epoch,
+		output_dir=output_dir,
+		device=device,
+		return_both_paradigms=False,
+	)
+
+	b_size, num_layers, h, w = batch_xai.shape
+	print(f"[SAS Pipeline] Loaded {b_size} intersecting correct samples across {num_layers} layers ({h}x{w}).")
+
+	# 3. Instantiate SAS and compute alignment scores
+	sas = SAS()
+	sas_tensor, _ = sas.compute_sas(batch_xai, batch_pca)  # [B, C, M]
+
+	# 4. Compute Pearson correlation agreement between metrics along B per layer: [C, M, M]
+	agreement_matrix, metric_names = sas.compute_metrics_agreement(sas_tensor)
+
+	# 5. Aggregate layer-wise statistics across images B
+	means = sas_tensor.mean(dim=0).detach().cpu()  # [C, M]
+	stds = sas_tensor.std(dim=0).detach().cpu()  # [C, M]
+	agreement_cpu = agreement_matrix.detach().cpu()
+
+	layer_word = "Block" if arch == "vit" else "Stage"
+	layer_summary = {}
+	agreement_summary = {}
+
+	for c in range(num_layers):
+		l_name = f"{layer_word} {c + 1}"
+		layer_summary[l_name] = {
+			metric: {
+				"mean": round(float(means[c, m].item()), 4),
+				"std": round(float(stds[c, m].item()), 4),
+			}
+			for m, metric in enumerate(metric_names)
+		}
+		agreement_summary[l_name] = {
+			"metrics": metric_names,
+			"matrix": [[round(float(v), 4) for v in row] for row in agreement_cpu[c].tolist()],
+		}
+
+	# 6. Save JSON payload to output/sas/sas_{full_model_id}.json
+	sas_dir = os.path.join(output_dir, "sas")
+	os.makedirs(sas_dir, exist_ok=True)
+	output_filepath = os.path.join(sas_dir, f"sas_{full_model_id}.json")
+
+	payload = {
+		"model_id": full_model_id,
+		"dataset": dataset_name,
+		"arch": arch,
+		"paradigm": paradigm,
+		"epoch": epoch,
+		"num_samples": b_size,
+		"num_layers": num_layers,
+		"metrics": metric_names,
+		"layer_summary": layer_summary,
+		"metric_agreement": agreement_summary,
+	}
+
+	with open(output_filepath, "w", encoding="utf-8") as f:
+		json.dump(payload, f, indent=2)
+
+	# 7. Pretty-print summary table
+	print(f"[SAS Pipeline] Saved summary to: {output_filepath}")
+	header = f"{'Layer':<10} | " + " | ".join(f"{m[:8]:<8}" for m in metric_names)
+	print("\n" + "=" * len(header))
+	print(header)
+	print("-" * len(header))
+	for c in range(num_layers):
+		l_name = f"{layer_word} {c + 1}"
+		vals = " | ".join(f"{means[c, m]:.4f} " for m in range(len(metric_names)))
+		print(f"{l_name:<10} | {vals}")
+	print("=" * len(header) + "\n")
+
+	return output_filepath

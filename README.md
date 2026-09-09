@@ -200,8 +200,6 @@ python main.py pca -d cifar10 -a vit -p std --eval-class-samples 5 --plot
 python main.py pca -d cifar10 -a vit -p lejepa --eval-class-samples 5 --plot
 ```
 
----
-
 ### 6. Computing Semantic Alignment Score (SAS)
 
 The Semantic Alignment Score quantitatively measures the correlation/overlap between a model's own XAI saliency map and

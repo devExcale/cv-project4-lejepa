@@ -124,7 +124,7 @@ CONFIG = {
 	"probe_epochs": 50,
 	"probe_lr": 0.1,
 	"probe_convergence_cutoff": 1e-3,
-	"probe_convergence_patience": 5,
+	"probe_convergence_patience": 50,
 	"pca_samples": 8,
 	"sigreg_slices": 1024,
 	"sigreg_tmax": 3.0,

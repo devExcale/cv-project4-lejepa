@@ -117,6 +117,9 @@ def main():
         return
 
     if args.mode == "train":
+        test_cuda()
+        print(f"Training {args.paradigm} model '{args.arch}' on dataset '{args.dataset}' on {args.device} for {args.epochs} epochs...")
+        
         model = build_model(
             args.arch,
             args.dataset,

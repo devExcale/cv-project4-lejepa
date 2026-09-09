@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from tqdm import tqdm
 
-from src.globals import CONFIG, DATASETS, DIR_DATA, PATH_DATASET_STATS
+from src.globals import CONFIG, DATASETS, DIR_DATA, PATH_DATASET_STATS, DIR_OUTPUT
 
 
 class HuggingFaceDataset(Dataset):
@@ -465,3 +465,177 @@ def get_balanced_test_loader(
         persistent_workers=num_workers > 0,
     )
     return loader, indices
+
+def _find_model_output_dir(
+    method: str,
+    dataset: str,
+    arch: str,
+    paradigm: str,
+    epoch: int,
+    output_dir: str = DIR_OUTPUT,
+) -> Tuple[str, str]:
+    """
+    Locates the directory in output/{method}/ matching {dataset}_{arch}_{paradigm}_epoch_{epoch}.
+    Returns:
+        (full_dir_path, full_model_id)
+    """
+    method_dir = os.path.join(output_dir, method)
+    if not os.path.isdir(method_dir):
+        raise FileNotFoundError(f"Method directory '{method_dir}' does not exist.")
+
+    # Primary targets to match
+    exact_stems = [
+        f"{dataset}_{arch}_{paradigm}_epoch_{epoch}",
+        f"{dataset}_{arch}_{paradigm}_epoch_{epoch:04d}",
+    ]
+
+    for stem in exact_stems:
+        candidate = os.path.join(method_dir, stem)
+        if os.path.isdir(candidate):
+            return candidate, stem
+
+    # Match directories that start with or contain the epoch identifier
+    prefix = f"{dataset}_{arch}_{paradigm}"
+    candidates = []
+    for d in os.listdir(method_dir):
+        full_path = os.path.join(method_dir, d)
+        if not os.path.isdir(full_path):
+            continue
+        if any(d.startswith(stem) for stem in exact_stems):
+            candidates.append((d, full_path))
+        elif d.startswith(prefix) and (
+            f"_epoch_{epoch}_" in d
+            or f"_epoch_{epoch:04d}_" in d
+            or d.endswith(f"_epoch_{epoch}")
+            or d.endswith(f"_epoch_{epoch:04d}")
+        ):
+            candidates.append((d, full_path))
+
+    if not candidates:
+        available = os.listdir(method_dir)
+        raise FileNotFoundError(
+            f"Could not find model output directory for method='{method}', "
+            f"dataset='{dataset}', arch='{arch}', paradigm='{paradigm}', epoch={epoch} in '{method_dir}'.\n"
+            f"Available folders: {available}"
+        )
+
+    candidates.sort(key=lambda x: x[0])
+    model_id, full_path = candidates[0]
+    return full_path, model_id
+
+
+def _get_correct_sample_keys(model_dir: str) -> set[str]:
+    """Scans the 'correct/' subfolder and extracts sample identifiers (c{x}_{y})."""
+    correct_dir = os.path.join(model_dir, "correct")
+    if not os.path.isdir(correct_dir):
+        raise FileNotFoundError(f"Missing 'correct' subfolder in '{model_dir}'")
+
+    key_pattern = re.compile(r"_(c\d+_\d+)\.pt$")
+    keys = set()
+    for fname in os.listdir(correct_dir):
+        if not fname.endswith(".pt"):
+            continue
+        match = key_pattern.search(fname)
+        if match:
+            keys.add(match.group(1))
+    return keys
+
+
+def get_correct_heatmap_batches(
+    dataset_name: str,
+    arch: str,
+    paradigm: str,
+    epoch: int,
+    other_epoch: Optional[int] = None,
+    output_dir: str = DIR_OUTPUT,
+    device: torch.device | str = "cpu",
+    return_both_paradigms: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Retrieves the intersection of correctly classified heatmaps across both paradigms
+    ('std' and 'lejepa') and returns batched [B, C, H, W] tensors for XAI and PCA.
+
+    Args:
+        dataset_name: 'cifar10', 'cifar100', etc.
+        arch: 'cnn' or 'vit'.
+        paradigm: 'std' (supervised) or 'lejepa'.
+        epoch: Epoch index for the requested paradigm.
+        other_epoch: Epoch index for the counterpart paradigm (defaults to `epoch`).
+        output_dir: Root directory of outputs (defaults to DIR_OUTPUT).
+        device: Torch device or string for the loaded tensors.
+        return_both_paradigms: If True, returns ((xai_req, pca_req), (xai_other, pca_other)).
+
+    Returns:
+        batch_xai [B, C, H, W], batch_pca [B, C, H, W]
+    """
+
+    # Normalize aliases
+    arch = "cnn" if arch in ("cnn", "resnet") else arch
+    paradigm = "std" if paradigm in ("std", "supervised") else paradigm
+    if arch not in ("cnn", "vit"):
+        raise ValueError(f"Unknown architecture '{arch}'. Expected 'cnn' or 'vit'.")
+    if paradigm not in ("std", "lejepa"):
+        raise ValueError(f"Unknown paradigm '{paradigm}'. Expected 'std' or 'lejepa'.")
+
+    other_paradigm = "lejepa" if paradigm == "std" else "std"
+    other_epoch = epoch if other_epoch is None else other_epoch
+    xai_method = "gradcam" if arch == "cnn" else "gmar"
+
+    # 1. Locate directories for the requested paradigm
+    dir_xai_req, id_xai_req = _find_model_output_dir(
+        xai_method, dataset_name, arch, paradigm, epoch, output_dir
+    )
+    dir_pca_req, id_pca_req = _find_model_output_dir(
+        "pca", dataset_name, arch, paradigm, epoch, output_dir
+    )
+
+    # 2. Locate directories for the counterpart paradigm
+    dir_xai_other, id_xai_other = _find_model_output_dir(
+        xai_method, dataset_name, arch, other_paradigm, other_epoch, output_dir
+    )
+    dir_pca_other, id_pca_other = _find_model_output_dir(
+        "pca", dataset_name, arch, other_paradigm, other_epoch, output_dir
+    )
+
+    # 3. Retrieve sample keys correctly predicted by BOTH models (Option B)
+    keys_xai_req = _get_correct_sample_keys(dir_xai_req)
+    keys_pca_req = _get_correct_sample_keys(dir_pca_req)
+    keys_xai_other = _get_correct_sample_keys(dir_xai_other)
+    keys_pca_other = _get_correct_sample_keys(dir_pca_other)
+
+    common_keys = keys_xai_req & keys_pca_req & keys_xai_other & keys_pca_other
+    if not common_keys:
+        raise RuntimeError(
+            f"No intersecting correct heatmaps found between {paradigm} (epoch {epoch}) "
+            f"and {other_paradigm} (epoch {other_epoch}) for {dataset_name} {arch}."
+        )
+
+    # Numerically deterministic order: c0_0, c0_1, ..., c1_0, ...
+    def _parse_key(key: str) -> Tuple[int, int]:
+        c_part, s_part = key[1:].split("_")
+        return int(c_part), int(s_part)
+
+    sorted_keys = sorted(common_keys, key=_parse_key)
+
+    # 4. Helper to load and batch tensors from [H, W, C] to [B, C, H, W]
+    def _load_batch(dir_path: str, method: str, model_id: str) -> torch.Tensor:
+        correct_folder = os.path.join(dir_path, "correct")
+        tensors = []
+        for k in sorted_keys:
+            filepath = os.path.join(correct_folder, f"{method}_{model_id}_{k}.pt")
+            t = torch.load(filepath, map_location=device)
+            # Permute [H, W, C] -> [C, H, W]
+            if t.ndim == 3 and t.shape[-1] in (4, 6):
+                t = t.permute(2, 0, 1)
+            tensors.append(t)
+        return torch.stack(tensors, dim=0)
+
+    batch_xai_req = _load_batch(dir_xai_req, xai_method, id_xai_req)
+    batch_pca_req = _load_batch(dir_pca_req, "pca", id_pca_req)
+
+    if return_both_paradigms:
+        batch_xai_other = _load_batch(dir_xai_other, xai_method, id_xai_other)
+        batch_pca_other = _load_batch(dir_pca_other, "pca", id_pca_other)
+        return (batch_xai_req, batch_pca_req), (batch_xai_other, batch_pca_other)
+
+    return batch_xai_req, batch_pca_req

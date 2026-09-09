@@ -9,8 +9,6 @@ learn representations. This framework conducts a layer-by-layer comparative anal
 structures emerging in LeJEPA's latent embedding space (via spatial PCA) align more naturally with internal attention
 and gradients than in supervised counterparts.
 
----
-
 ## Environment & Requirements
 
 The codebase requires **Python 3.10+** and is built on PyTorch.
@@ -20,8 +18,6 @@ Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-
----
 
 ## Directory & Artifact Structure
 
@@ -70,8 +66,6 @@ All data, model checkpoints, and generated heatmaps adhere to the canonical stru
     * CNN (`CIFARResNet18`): $C = 4$ stages (`layer1` through `layer4`).
     * ViT (`VisionTransformer`): $C = 6$ encoder transformer blocks.
 * **Batched Heatmaps:** Loaded and permuted to $[B, C, 32, 32]$ for vectorized evaluation.
-
----
 
 ## Execution Workflow
 
@@ -149,8 +143,6 @@ python main.py compare_relative -d cifar10 -a vit
 This generates `checkpoints/{dataset}_{arch}_relative_accuracy_comparison.json`, pairing each epoch checkpoint with its
 counterpart.
 
----
-
 ### 5. Heatmap & Latent Representation Generation
 
 Extract interpretability maps on a balanced test subset.
@@ -208,8 +200,6 @@ its internal PCA semantic map.
 ```python
 # TODO
 ```
-
----
 
 ## CLI Options Reference
 

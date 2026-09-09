@@ -426,10 +426,14 @@ class SAS:
 		# [C, M, 1] * [C, 1, M] mediante broadcasting -> [C, M, M]
 		std_matrix = std.unsqueeze(2) * std.unsqueeze(1)
 
-		# 6. Matrice di Correlazione [C, M, M]
-		corr_matrix = cov / (std_matrix + 1e-8)
+		# 6. Matrice di Correlazione [C, M, M]. Do not add epsilon directly
+		# to the denominator: that biases correlations when a metric has a
+		# small (but non-zero) variance and can make the diagonal differ from 1.
+		denominator = std_matrix.clamp_min(torch.finfo(std_matrix.dtype).tiny)
+		corr_matrix = cov / denominator
+		corr_matrix = torch.where(std_matrix > 0, corr_matrix, torch.zeros_like(corr_matrix))
 
-		# Clamp per evitare errori di precisione numerica float32 fuori da [-1, 1]
+		# Clamp only floating-point roundoff outside [-1, 1].
 		corr_matrix = torch.clamp(corr_matrix, -1.0, 1.0)
 
 		return corr_matrix, self.metrics_list

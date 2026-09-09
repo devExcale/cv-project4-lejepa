@@ -142,6 +142,7 @@ python main.py compare_relative -d cifar10 -a vit
 
 This generates `checkpoints/{dataset}_{arch}_relative_accuracy_comparison.json`, pairing each epoch checkpoint with its
 counterpart.
+Relative accuracy rescales validation accuracy so chance performance is 0% and the best probed validation accuracy for that training trajectory is 100%, using 100 * (val_acc - chance_accuracy) / (accuracy_final - chance_accuracy).
 
 ### 5. Heatmap & Latent Representation Generation
 
@@ -196,9 +197,11 @@ python main.py pca -d cifar10 -a vit -p lejepa --eval-class-samples 5 --plot
 
 The Semantic Alignment Score quantitatively measures the correlation/overlap between a model's own XAI saliency map and
 its internal PCA semantic map.
+When run, SAS loads the matching correct Grad-CAM (CNN) or GMAR (ViT) and PCA tensors and evaluates only sample IDs that are correctly classified by both the supervised and LeJEPA counterparts.
+Use --epoch N and --other-epoch to select the checkpoint epoch whose saved XAI/PCA tensors SAS evaluates for both paradigms (e.g. --epoch 100 --other-epoch 100).
 
-```python
-# TODO
+
+```python main.py sas -d cifar10 -a cnn -p std --epoch 100 --other-epoch 100
 ```
 
 ## CLI Options Reference

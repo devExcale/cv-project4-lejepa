@@ -1421,106 +1421,210 @@ def run_pca_for_all_checkpoints(
 	return outputs
 
 
-def run_sas_pipeline(
-		dataset_name: str,
-		arch: str,
-		paradigm: str,
-		epoch: int,
-		device: torch.device | str = "cpu",
-		other_epoch: int | None = None,
-		output_dir: str = DIR_OUTPUT,
+def _save_sas_layer_progression_plot(
+        means: torch.Tensor,
+        stds: torch.Tensor,
+        metric_names: list[str],
+        layer_names: list[str],
+        output_filepath: str,
 ) -> str:
-	"""
-	Computes SAS and metric agreement for the intersection of correctly classified samples.
-	Saves aggregated metrics to output/sas/sas_{full_model_id}.json.
-	"""
-	# 1. Resolve full_model_id from the XAI output directory
-	xai_method = "gradcam" if arch in ("cnn", "resnet") else "gmar"
-	try:
-		_, full_model_id = _find_model_output_dir(
-			xai_method, dataset_name, arch, paradigm, epoch, output_dir
-		)
-	except FileNotFoundError:
-		full_model_id = f"{dataset_name}_{arch}_{paradigm}_epoch_{epoch:04d}"
+    """Save the mean SAS-metric progression across layers with +/- 1 std shading."""
+    x = np.arange(1, len(layer_names) + 1)
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-	print(f"\n[SAS Pipeline] Initializing for model: {full_model_id}")
+    means_np = means.detach().cpu().numpy()
+    stds_np = stds.detach().cpu().numpy()
 
-	# 2. Retrieve intersection of correctly classified batches: [B, C, 32, 32]
-	batch_xai, batch_pca = get_correct_heatmap_batches(
-		dataset_name=dataset_name,
-		arch=arch,
-		paradigm=paradigm,
-		epoch=epoch,
-		other_epoch=other_epoch,
-		output_dir=output_dir,
-		device=device,
-		return_both_paradigms=False,
-	)
+    for metric_index, metric_name in enumerate(metric_names):
+        y = means_np[:, metric_index]
+        y_std = stds_np[:, metric_index]
+        line = ax.plot(x, y, marker="o", linewidth=2, label=metric_name)[0]
+        ax.fill_between(
+            x,
+            y - y_std,
+            y + y_std,
+            alpha=0.12,
+            color=line.get_color(),
+        )
 
-	b_size, num_layers, h, w = batch_xai.shape
-	print(f"[SAS Pipeline] Loaded {b_size} intersecting correct samples across {num_layers} layers ({h}x{w}).")
+    ax.set_xticks(x)
+    ax.set_xticklabels(layer_names)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Metric value")
+    ax.set_title("SAS metric progression across layers (mean +/- 1 std)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(title="Metric", ncol=2)
+    fig.tight_layout()
+    fig.savefig(output_filepath, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return output_filepath
 
-	# 3. Instantiate SAS and compute alignment scores
-	sas = SAS()
-	sas_tensor, _ = sas.compute_sas(batch_xai, batch_pca)  # [B, C, M]
 
-	# 4. Compute Pearson correlation agreement between metrics along B per layer: [C, M, M]
-	agreement_matrix, metric_names = sas.compute_metrics_agreement(sas_tensor)
+def _print_sas_metric_correlations(
+        agreement_matrix: torch.Tensor,
+        metric_names: list[str],
+        layer_names: list[str],
+) -> None:
+    """Pretty-print the per-layer Pearson correlation matrix between SAS metrics."""
+    if agreement_matrix.numel() == 0:
+        print("[SAS Metric Correlation] Unavailable: at least two samples are required.")
+        return
 
-	# 5. Aggregate layer-wise statistics across images B
-	means = sas_tensor.mean(dim=0).detach().cpu()  # [C, M]
-	stds = sas_tensor.std(dim=0).detach().cpu()  # [C, M]
-	agreement_cpu = agreement_matrix.detach().cpu()
+    name_width = max(10, max(len(name) for name in metric_names) + 2)
+    value_width = 10
 
-	layer_word = "Block" if arch == "vit" else "Stage"
-	layer_summary = {}
-	agreement_summary = {}
+    print("\n[SAS Metric Correlation] Pearson correlation between metrics across samples")
+    for layer_index, layer_name in enumerate(layer_names):
+        matrix = agreement_matrix[layer_index]
+        header = " " * name_width + "".join(f"{name:>{value_width}}" for name in metric_names)
+        print(f"\n{layer_name}")
+        print(header)
+        print("-" * len(header))
+        for row_index, row_name in enumerate(metric_names):
+            values = "".join(f"{float(matrix[row_index, col_index]):>{value_width}.4f}" for col_index in range(len(metric_names)))
+            print(f"{row_name:>{name_width}}{values}")
+    print()
 
-	for c in range(num_layers):
-		l_name = f"{layer_word} {c + 1}"
-		layer_summary[l_name] = {
-			metric: {
-				"mean": round(float(means[c, m].item()), 4),
-				"std": round(float(stds[c, m].item()), 4),
-			}
-			for m, metric in enumerate(metric_names)
-		}
-		agreement_summary[l_name] = {
-			"metrics": metric_names,
-			"matrix": [[round(float(v), 4) for v in row] for row in agreement_cpu[c].tolist()],
-		}
 
-	# 6. Save JSON payload to output/sas/sas_{full_model_id}.json
-	sas_dir = os.path.join(output_dir, "sas")
-	os.makedirs(sas_dir, exist_ok=True)
-	output_filepath = os.path.join(sas_dir, f"sas_{full_model_id}.json")
+def run_sas_pipeline(
+        dataset_name: str,
+        arch: str,
+        paradigm: str,
+        epoch: int,
+        device: torch.device | str = "cpu",
+        other_epoch: int | None = None,
+        output_dir: str = DIR_OUTPUT,
+) -> str:
+    """
+    Compute SAS metrics for samples correctly classified by both paradigms.
 
-	payload = {
-		"model_id": full_model_id,
-		"dataset": dataset_name,
-		"arch": arch,
-		"paradigm": paradigm,
-		"epoch": epoch,
-		"num_samples": b_size,
-		"num_layers": num_layers,
-		"metrics": metric_names,
-		"layer_summary": layer_summary,
-		"metric_agreement": agreement_summary,
-	}
+    In addition to the JSON summary, this function:
+      * saves a per-layer SAS metric progression plot; and
+      * prints the per-layer Pearson correlation matrix between SAS metrics.
+    """
+    # 1. Resolve full_model_id from the XAI output directory.
+    xai_method = "gradcam" if arch in ("cnn", "resnet") else "gmar"
+    try:
+        _, full_model_id = _find_model_output_dir(
+            xai_method, dataset_name, arch, paradigm, epoch, output_dir
+        )
+    except FileNotFoundError:
+        full_model_id = f"{dataset_name}_{arch}_{paradigm}_epoch_{epoch:04d}"
 
-	with open(output_filepath, "w", encoding="utf-8") as f:
-		json.dump(payload, f, indent=2)
+    print(f"\n[SAS Pipeline] Initializing for model: {full_model_id}")
 
-	# 7. Pretty-print summary table
-	print(f"[SAS Pipeline] Saved summary to: {output_filepath}")
-	header = f"{'Layer':<10} | " + " | ".join(f"{m[:8]:<8}" for m in metric_names)
-	print("\n" + "=" * len(header))
-	print(header)
-	print("-" * len(header))
-	for c in range(num_layers):
-		l_name = f"{layer_word} {c + 1}"
-		vals = " | ".join(f"{means[c, m]:.4f} " for m in range(len(metric_names)))
-		print(f"{l_name:<10} | {vals}")
-	print("=" * len(header) + "\n")
+    # 2. Retrieve the shared correctly-classified samples: [B, C, H, W].
+    batch_xai, batch_pca = get_correct_heatmap_batches(
+        dataset_name=dataset_name,
+        arch=arch,
+        paradigm=paradigm,
+        epoch=epoch,
+        other_epoch=other_epoch,
+        output_dir=output_dir,
+        device=device,
+        return_both_paradigms=False,
+    )
 
-	return output_filepath
+    if batch_xai.shape != batch_pca.shape:
+        raise ValueError(
+            "XAI and PCA batches must have the same shape, got "
+            f"{tuple(batch_xai.shape)} and {tuple(batch_pca.shape)}"
+        )
+    if batch_xai.ndim != 4:
+        raise ValueError(f"Expected SAS inputs shaped [B, C, H, W], got {tuple(batch_xai.shape)}")
+
+    b_size, num_layers, h, w = batch_xai.shape
+    print(f"[SAS Pipeline] Loaded {b_size} intersecting correct samples across {num_layers} layers ({h}x{w}).")
+
+    # 3. Compute all SAS component metrics: [B, C, M].
+    sas = SAS()
+    sas_tensor, _ = sas.compute_sas(batch_xai, batch_pca)
+    metric_names = sas.metrics_list
+
+    # 4. Aggregate layer-wise statistics across images B.
+    means = sas_tensor.mean(dim=0).detach().cpu()  # [C, M]
+    # correction=0 keeps std finite when B == 1; correlation is handled separately below.
+    stds = sas_tensor.std(dim=0, unbiased=False).detach().cpu()  # [C, M]
+
+    layer_word = "Block" if arch == "vit" else "Stage"
+    layer_names = [f"{layer_word} {c + 1}" for c in range(num_layers)]
+
+    # 5. Correlation needs at least two observations. Do not make the whole SAS run fail
+    #    when only one intersecting sample is available.
+    if b_size >= 2:
+        agreement_matrix, agreement_metric_names = sas.compute_metrics_agreement(sas_tensor)
+        if agreement_metric_names != metric_names:
+            raise RuntimeError("SAS metric ordering changed while computing metric agreement")
+        agreement_cpu = agreement_matrix.detach().cpu()
+    else:
+        agreement_cpu = torch.empty((0, len(metric_names), len(metric_names)))
+        print("[SAS Pipeline] Metric correlation skipped because fewer than 2 samples were available.")
+
+    layer_summary = {}
+    agreement_summary = {}
+    for c, layer_name in enumerate(layer_names):
+        layer_summary[layer_name] = {
+            metric: {
+                "mean": round(float(means[c, m].item()), 4),
+                "std": round(float(stds[c, m].item()), 4),
+            }
+            for m, metric in enumerate(metric_names)
+        }
+        if b_size >= 2:
+            agreement_summary[layer_name] = {
+                "metrics": metric_names,
+                "matrix": [
+                    [round(float(v), 4) for v in row]
+                    for row in agreement_cpu[c].tolist()
+                ],
+            }
+
+    # 6. Save JSON and the per-layer progression figure under output/sas/.
+    sas_dir = os.path.join(output_dir, "sas")
+    os.makedirs(sas_dir, exist_ok=True)
+    output_filepath = os.path.join(sas_dir, f"sas_{full_model_id}.json")
+    plot_filepath = os.path.join(sas_dir, f"sas_{full_model_id}_layer_progression.png")
+
+    _save_sas_layer_progression_plot(
+        means=means,
+        stds=stds,
+        metric_names=metric_names,
+        layer_names=layer_names,
+        output_filepath=plot_filepath,
+    )
+
+    payload = {
+        "model_id": full_model_id,
+        "dataset": dataset_name,
+        "arch": arch,
+        "paradigm": paradigm,
+        "epoch": epoch,
+        "other_epoch": other_epoch,
+        "num_samples": b_size,
+        "num_layers": num_layers,
+        "metrics": metric_names,
+        "layer_progression_plot": plot_filepath,
+        "layer_summary": layer_summary,
+        "metric_agreement": agreement_summary,
+    }
+
+    with open(output_filepath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    # 7. Print the layer-wise means.
+    print(f"[SAS Pipeline] Saved summary to: {output_filepath}")
+    print(f"[SAS Pipeline] Saved layer progression plot to: {plot_filepath}")
+    header = f"{'Layer':<10} | " + " | ".join(f"{m[:8]:<8}" for m in metric_names)
+    print("\n" + "=" * len(header))
+    print(header)
+    print("-" * len(header))
+    for c, layer_name in enumerate(layer_names):
+        vals = " | ".join(f"{float(means[c, m]):.4f} " for m in range(len(metric_names)))
+        print(f"{layer_name:<10} | {vals}")
+    print("=" * len(header))
+
+    # 8. Print metric-correlation matrices for every layer/block.
+    _print_sas_metric_correlations(agreement_cpu, metric_names, layer_names)
+
+    return output_filepath
+

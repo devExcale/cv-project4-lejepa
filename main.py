@@ -47,6 +47,8 @@ def parse_args():
     parser.add_argument("-a", "--arch", choices=["cnn", "vit"])
     parser.add_argument("-p", "--paradigm", choices=["std", "lejepa"])
     parser.add_argument("-e", "--epochs", type=int, default=CONFIG["epochs"])
+    parser.add_argument("--epoch", type=int, default=None, help="Checkpoint epoch used by SAS mode")
+    parser.add_argument("--other-epoch", type=int, default=None, help="Optional counterpart-paradigm epoch used to form the shared-correct SAS sample set")
     parser.add_argument("--batch_size", type=int, default=CONFIG["batch_size"])
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", default=str(DEVICE))
@@ -343,6 +345,7 @@ def main():
             paradigm=args.paradigm,
             epoch=args.epoch,
             device=device,
+            other_epoch=args.other_epoch,
         )
         return
 

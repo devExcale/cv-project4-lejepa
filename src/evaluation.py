@@ -2,7 +2,7 @@ import json
 import math
 import os
 from copy import deepcopy
-from typing import Tuple, cast
+from typing import Tuple, cast, Dict
 
 import numpy as np
 import torch
@@ -11,11 +11,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from src.data import get_or_compute_stats
+from src.data import get_or_compute_stats, get_dataloaders
 from src.globals import CONFIG, DATASETS, DIR_DATA, DIR_OUTPUT
+from src.network import LinearProbeModel, build_model
 from src.utils import GradCAM, GuidedBackprop, GMAR
 
 
@@ -49,9 +50,9 @@ def _normalize_map(x: torch.Tensor) -> torch.Tensor:
 
 
 def pca_outputs(
-	feature_map: torch.Tensor,
-	image_index: int = 0,
-	output_size: tuple[int, int] | None = None,
+		feature_map: torch.Tensor,
+		image_index: int = 0,
+		output_size: tuple[int, int] | None = None,
 ) -> dict[str, torch.Tensor]:
 	"""Run PCA once and derive comparable semantic outputs plus an RGB visualization.
 
@@ -90,9 +91,9 @@ def pca_outputs(
 
 
 def pca_mask(
-	feature_map: torch.Tensor,
-	image_index: int = 0,
-	output_size: tuple[int, int] | None = None,
+		feature_map: torch.Tensor,
+		image_index: int = 0,
+		output_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
 	return pca_outputs(feature_map, image_index=image_index, output_size=output_size)["mask"]
 
@@ -142,6 +143,205 @@ def get_class_name(dataset_name: str, class_idx: int) -> str:
 	return f"Class {class_idx}"
 
 
+def _get_spatial_feature_maps(model: nn.Module, images: torch.Tensor) -> tuple[torch.Tensor, ...]:
+	"""Extract spatial [B, C, H, W] feature maps across all stages/blocks."""
+	feature_extractor = model if hasattr(model, "forward_features") else getattr(model, "backbone", model)
+	if not hasattr(feature_extractor, "forward_features"):
+		raise ValueError("The model or model.backbone must implement 'forward_features()'")
+
+	features = feature_extractor.forward_features(images)
+
+	# ViT backbones return (tuple(spatial_maps), tuple(class_tokens))
+	if (
+			isinstance(features, tuple)
+			and len(features) == 2
+			and isinstance(features[0], (tuple, list))
+	):
+		features = features[0]
+
+	if isinstance(features, torch.Tensor):
+		features = (features,)
+
+	if not isinstance(features, (tuple, list)) or not features:
+		raise ValueError("forward_features() did not return any spatial feature maps")
+
+	spatial_maps = tuple(features)
+	for layer_index, feature_map in enumerate(spatial_maps):
+		if not isinstance(feature_map, torch.Tensor) or feature_map.ndim != 4:
+			raise ValueError(
+				f"PCA requires [B, C, H, W] spatial maps; layer {layer_index} returned "
+				f"{type(feature_map).__name__} with shape {getattr(feature_map, 'shape', None)}"
+			)
+	return spatial_maps
+
+
+def run_pca_pipeline(
+		model: nn.Module,
+		loader: DataLoader,
+		dataset_name: str,
+		arch: str,
+		paradigm: str,
+		device: torch.device,
+		val_fraction: float = CONFIG["val_fraction"],
+		output_name: str | None = None,
+		plot: bool = True,
+		resume: bool = True,
+) -> str:
+	"""
+	Extract spatial PCA semantic maps across all layers/blocks with correct/missed routing.
+	Produces either a multi-page PDF or individual [H, W, C] tensors.
+	"""
+	if loader is None:
+		raise ValueError("A DataLoader must be provided.")
+
+	model.eval().to(device)
+
+	model_id = f"{dataset_name}_{arch}_{paradigm}"
+	if output_name:
+		model_id = f"{model_id}_{output_name}"
+	output_stem = f"pca_{model_id}"
+	output_dir = os.path.join(DIR_OUTPUT, "pca", model_id)
+	os.makedirs(output_dir, exist_ok=True)
+
+	# --- Individual [H, W, C] tensor heatmaps (no plot) ---
+	if not plot:
+		correct_dir = os.path.join(output_dir, "correct")
+		missed_dir = os.path.join(output_dir, "missed")
+		os.makedirs(correct_dir, exist_ok=True)
+		os.makedirs(missed_dir, exist_ok=True)
+
+		class_counters: dict[int, int] = {}
+		total_saved = 0
+		total_skipped = 0
+
+		for images, labels in loader:
+			batch_size = images.size(0)
+			needed_indices = []
+			sample_filenames = []
+
+			for b in range(batch_size):
+				true_label = int(labels[b])
+				point_idx = class_counters.get(true_label, 0)
+				filename = f"{output_stem}_c{true_label}_{point_idx}.pt"
+				sample_filenames.append(filename)
+				class_counters[true_label] = point_idx + 1
+
+				cached_correct = os.path.join(correct_dir, filename)
+				cached_missed = os.path.join(missed_dir, filename)
+
+				if resume and (os.path.exists(cached_correct) or os.path.exists(cached_missed)):
+					total_skipped += 1
+				else:
+					needed_indices.append(b)
+
+			if not needed_indices:
+				continue
+
+			sub_inputs = images[needed_indices].to(device)
+			image_size = sub_inputs.shape[-2:]
+
+			with torch.no_grad():
+				preds = model(sub_inputs).argmax(dim=-1)
+				features = _get_spatial_feature_maps(model, sub_inputs)
+
+			num_layers = len(features)
+			batch_tensors = []
+
+			for b_idx in range(len(needed_indices)):
+				layer_maps = []
+				for l_idx in range(num_layers):
+					res = pca_outputs(features[l_idx], image_index=b_idx, output_size=image_size)
+					layer_maps.append(res["semantic_map"])
+				# Stack layers along final dimension: [H, W, C]
+				stacked_sample = torch.stack(layer_maps, dim=-1).cpu()
+				batch_tensors.append(stacked_sample)
+
+			for idx, b in enumerate(needed_indices):
+				is_correct = (preds[idx].item() == int(labels[b]))
+				target_dir = correct_dir if is_correct else missed_dir
+				torch.save(batch_tensors[idx], os.path.join(target_dir, sample_filenames[b]))
+				total_saved += 1
+
+		print(f"[PCA] Directory: {output_dir} | Saved: {total_saved} new | Skipped: {total_skipped} existing")
+		return output_dir
+
+	# --- Multi-page PDF preview plot ---
+	output_filepath = os.path.join(output_dir, f"{output_stem}.pdf")
+	if resume and os.path.exists(output_filepath):
+		print(f"[PCA Resume] Visualizations already exist at: {output_filepath}. Skipping.")
+		return output_filepath
+
+	mean, std = get_or_compute_stats(dataset_name, val_fraction=val_fraction)
+	mean_array = np.array(mean).reshape(1, 3, 1, 1)
+	std_array = np.array(std).reshape(1, 3, 1, 1)
+
+	collected_originals, collected_labels, collected_preds = [], [], []
+	collected_heatmaps = []
+	collected_rgbs = []
+
+	with torch.no_grad():
+		for images, labels in loader:
+			inputs = images.to(device)
+			image_size = inputs.shape[-2:]
+
+			preds = model(inputs).argmax(dim=-1)
+			collected_preds.extend(preds.cpu().tolist())
+
+			features = _get_spatial_feature_maps(model, inputs)
+			num_layers = len(features)
+
+			for b_idx in range(images.size(0)):
+				sample_heatmaps = []
+				sample_rgbs = []
+				for l_idx in range(num_layers):
+					res = pca_outputs(features[l_idx], image_index=b_idx, output_size=image_size)
+					sample_heatmaps.append(res["semantic_map"].cpu().numpy())
+
+					# Interpolate pseudo-RGB visualization to image resolution
+					rgb_t = res["rgb"].permute(2, 0, 1).unsqueeze(0)
+					rgb_up = F.interpolate(rgb_t, size=image_size, mode="bilinear", align_corners=False).squeeze(
+						0).permute(1, 2, 0)
+					sample_rgbs.append(rgb_up.cpu().numpy())
+
+				collected_heatmaps.append(sample_heatmaps)
+				collected_rgbs.append(sample_rgbs)
+
+			orig = inputs.detach().cpu().numpy() * std_array + mean_array
+			collected_originals.append(np.clip(orig.transpose(0, 2, 3, 1), 0.0, 1.0))
+			collected_labels.extend(labels.tolist())
+
+	originals = np.concatenate(collected_originals, axis=0)
+	num_samples = len(collected_heatmaps)
+	num_layers = len(collected_heatmaps[0])
+	layer_word = "Block" if arch == "vit" else "Stage"
+	layer_names = [f"{layer_word} {i + 1}" for i in range(num_layers)]
+
+	heatmaps_by_layer = [
+		np.stack([collected_heatmaps[s][l] for s in range(num_samples)], axis=0)
+		for l in range(num_layers)
+	]
+	rgbs_by_layer = [
+		np.stack([collected_rgbs[s][l] for s in range(num_samples)], axis=0)
+		for l in range(num_layers)
+	]
+
+	_save_saliency_pdf(
+		output_filepath=output_filepath,
+		originals=originals,
+		labels=collected_labels,
+		preds=collected_preds,
+		dataset_name=dataset_name,
+		heatmaps_by_layer=heatmaps_by_layer,
+		layer_names=layer_names,
+		guided_grads=None,
+		secondary_maps_by_layer=rgbs_by_layer,
+		method_name="PC1 Heatmap",
+		secondary_name="PCA RGB",
+	)
+	print(f"[PCA Complete] Visualizations saved to: {output_filepath}")
+	return output_filepath
+
+
 def _save_saliency_pdf(
 		output_filepath: str,
 		originals: np.ndarray,
@@ -151,13 +351,15 @@ def _save_saliency_pdf(
 		heatmaps_by_layer: list[np.ndarray],
 		layer_names: list[str],
 		guided_grads: np.ndarray | None = None,
+		secondary_maps_by_layer: list[np.ndarray] | None = None,
 		method_name: str = "CAM",
+		secondary_name: str | None = None,
 		samples_per_page: int = 10,
 		dpi: int = 120,
 ) -> None:
 	"""
-	Renders a multi-page PDF using PdfPages, generating small page figures
-	and immediately closing them to prevent Python & PDF viewer memory blowups.
+	Common PDF generation function for Grad-CAM, GMAR, and PCA.
+	Supports single-column heatmaps, guided gradient overlays, or multi-channel secondary maps (PCA RGB).
 	"""
 
 	total_samples = len(originals)
@@ -166,7 +368,8 @@ def _save_saliency_pdf(
 
 	num_layers = len(layer_names)
 	has_guided = guided_grads is not None
-	num_cols = 1 + (2 * num_layers if has_guided else num_layers)
+	has_secondary = (secondary_maps_by_layer is not None) or has_guided
+	num_cols = 1 + (2 * num_layers if has_secondary else num_layers)
 	num_pages = math.ceil(total_samples / samples_per_page)
 
 	os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
@@ -209,29 +412,35 @@ def _save_saliency_pdf(
 				for l_idx, layer_name in enumerate(layer_names):
 					cam = heatmaps_by_layer[l_idx][sample_i]
 
-					if has_guided:
-						col_heat = 1 + 2 * l_idx
-						col_guided = 2 + 2 * l_idx
+					if has_secondary:
+						col_primary = 1 + 2 * l_idx
+						col_secondary = 2 + 2 * l_idx
 
-						# Rollout Heatmap
-						axes[row_idx, col_heat].imshow(cam, cmap="jet", rasterized=True)
-						axes[row_idx, col_heat].set_title(f"{layer_name}\nHeatmap", fontsize=8)
-						axes[row_idx, col_heat].axis("off")
+						# Primary Heatmap
+						axes[row_idx, col_primary].imshow(cam, cmap="jet", rasterized=True)
+						axes[row_idx, col_primary].set_title(f"{layer_name}\n{method_name}", fontsize=8)
+						axes[row_idx, col_primary].axis("off")
 
-						# Guided overlay
-						guided = guided_grads[sample_i] * cam[..., np.newaxis]
-						guided -= guided.mean()
-						guided /= (guided.std() + 1e-8)
-						guided = np.clip(guided * 0.15 + 0.5, 0.0, 1.0)
+						# Secondary (Guided Backprop or Auxiliary Map e.g. PCA RGB)
+						if has_guided:
+							guided = guided_grads[sample_i] * cam[..., np.newaxis]
+							guided -= guided.mean()
+							guided /= (guided.std() + 1e-8)
+							guided = np.clip(guided * 0.15 + 0.5, 0.0, 1.0)
+							axes[row_idx, col_secondary].imshow(guided, rasterized=True)
+							title = f"{layer_name}\nGuided {method_name}"
+						else:
+							sec_map = secondary_maps_by_layer[l_idx][sample_i]
+							axes[row_idx, col_secondary].imshow(sec_map, rasterized=True)
+							title = f"{layer_name}\n{secondary_name or 'Secondary'}"
 
-						axes[row_idx, col_guided].imshow(guided, rasterized=True)
-						axes[row_idx, col_guided].set_title(f"{layer_name}\nGuided {method_name}", fontsize=8)
-						axes[row_idx, col_guided].axis("off")
+						axes[row_idx, col_secondary].set_title(title, fontsize=8)
+						axes[row_idx, col_secondary].axis("off")
 					else:
-						col_heat = 1 + l_idx
-						axes[row_idx, col_heat].imshow(cam, cmap="jet", rasterized=True)
-						axes[row_idx, col_heat].set_title(f"{layer_name}\n{method_name}", fontsize=8)
-						axes[row_idx, col_heat].axis("off")
+						col_primary = 1 + l_idx
+						axes[row_idx, col_primary].imshow(cam, cmap="jet", rasterized=True)
+						axes[row_idx, col_primary].set_title(f"{layer_name}\n{method_name}", fontsize=8)
+						axes[row_idx, col_primary].axis("off")
 
 			# Save the individual page figure into the multi-page stream
 			plt.tight_layout()
@@ -1088,3 +1297,125 @@ def linear_probe(
 		for parameter, requires_grad in zip(backbone.parameters(), original_requires_grad):
 			parameter.requires_grad_(requires_grad)
 
+
+def _run_pca_checkpoint(
+		checkpoint_path: str,
+		dataset: str,
+		arch: str,
+		paradigm: str,
+		test_loader: DataLoader,
+		device: torch.device,
+		num_samples: int,
+		val_fraction: float,
+		model_config: Dict,
+		output_name: str,
+		probe_record: Dict | None = None,
+		plot: bool = False,
+):
+	"""
+	Run spatial PCA for one checkpoint using the unified PCA pipeline.
+	"""
+
+	checkpoint = torch.load(checkpoint_path, map_location=device)
+	model = build_model(
+		arch,
+		dataset,
+		paradigm,
+		num_slices=model_config.get("num_slices", CONFIG["sigreg_slices"]),
+		t_max=model_config.get("t_max", CONFIG["sigreg_tmax"]),
+		n_points=model_config.get("n_points", CONFIG["sigreg_points"]),
+		lamb=model_config.get("lamb", CONFIG["lejepa_lambda"]),
+	).to(device)
+	model.load_state_dict(checkpoint["model_state_dict"])
+	model.eval()
+
+	epoch = int(checkpoint.get("epoch", -1))
+	probe_record = probe_record or {}
+	probe_path = probe_record.get("probe_path")
+	if not probe_path or not os.path.exists(probe_path):
+		raise FileNotFoundError(
+			f"PCA requires the completed linear probe for backbone epoch {epoch}, "
+			f"but it was not found at '{probe_path}'. Run mode 'probe' first."
+		)
+
+	probe_checkpoint = torch.load(probe_path, map_location="cpu")
+	if not probe_checkpoint.get("completed", False):
+		raise RuntimeError(
+			f"Probe for backbone epoch {epoch} is incomplete. Resume mode 'probe' before running PCA."
+		)
+
+	backbone = model.backbone if paradigm == "lejepa" else model
+	head = nn.Linear(backbone.embed_dim, DATASETS[dataset]["num_classes"]).to(device)
+	head.load_state_dict(probe_checkpoint["head_state_dict"])
+	probe_model = LinearProbeModel(backbone, head).to(device)
+	probe_model.eval()
+
+	eval_loader = test_loader
+	if num_samples is not None and 0 < num_samples < len(test_loader.dataset):
+		subset = Subset(test_loader.dataset, list(range(num_samples)))
+		eval_loader = DataLoader(
+			subset,
+			batch_size=test_loader.batch_size,
+			shuffle=False,
+			num_workers=test_loader.num_workers,
+		)
+
+	return run_pca_pipeline(
+		model=probe_model,
+		loader=eval_loader,
+		dataset_name=dataset,
+		arch=arch,
+		paradigm=paradigm,
+		device=device,
+		val_fraction=val_fraction,
+		output_name=output_name,
+		plot=plot,
+		resume=True,
+	)
+
+
+def run_pca_for_all_checkpoints(
+	summary: Dict,
+	batch_size: int,
+	device: torch.device,
+	num_samples: int,
+	val_fraction: float = CONFIG["val_fraction"],
+	plot: bool = False,
+):
+	"""Run PCA on every backbone checkpoint represented in the probe summary."""
+	if num_samples < 1:
+		return []
+
+	dataset = summary["dataset"]
+	arch = summary["arch"]
+	paradigm = summary["paradigm"]
+	model_config = summary.get("model_config", {})
+
+	_, _, test_loader = get_dataloaders(
+		dataset,
+		batch_size=batch_size,
+		paradigm="std",
+		val_fraction=val_fraction,
+		include_test=True,
+	)
+
+	outputs = []
+	for record in summary["probe_results"]:
+		epoch = int(record["epoch"])
+		relative = record.get("relative_accuracy")
+		relative_tag = "na" if relative is None else f"{float(relative):06.2f}"
+		outputs.append(_run_pca_checkpoint(
+			record["checkpoint_path"],
+			dataset,
+			arch,
+			paradigm,
+			test_loader,
+			device,
+			num_samples,
+			val_fraction,
+			model_config,
+			f"epoch_{epoch:04d}_relative_{relative_tag}",
+			probe_record=record,
+			plot=plot,
+		))
+	return outputs

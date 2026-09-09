@@ -5,11 +5,24 @@ import torch
 import torch.nn as nn
 
 from src.data import get_dataloaders, get_balanced_test_loader
-from src.evaluation import evaluate_model, run_gmar_pipeline, run_gradcam_pipeline
+from src.evaluation import (
+    evaluate_model,
+    run_gmar_pipeline,
+    run_gradcam_pipeline,
+    run_pca_pipeline,
+)
+
 from src.globals import CONFIG, DATASETS, DEVICE, set_seed
 from src.network import LinearProbeModel, build_model
 from src.train import train_lejepa, train_supervised
-from src.utils import build_relative_accuracy_comparison, load_probe_summary, probe_all_checkpoints, run_pca_for_all_checkpoints, test_config, test_cuda, test_pipeline
+from src.utils import (
+    build_relative_accuracy_comparison,
+    load_probe_summary,
+    probe_all_checkpoints,
+    test_config,
+    test_cuda,
+    test_pipeline,
+)
 
 
 def parse_args():
@@ -175,18 +188,6 @@ def main():
         )
         return
 
-    if args.mode == "pca":
-        summary = load_probe_summary(args.dataset, args.arch, args.paradigm)
-        run_pca_for_all_checkpoints(
-            summary,
-            args.batch_size,
-            device,
-            args.pca_samples,
-            val_fraction=args.val_fraction,
-            plot=args.plot,
-        )
-        return
-
     if args.mode == "eval":
         summary = load_probe_summary(args.dataset, args.arch, args.paradigm)
         checkpoint_path = summary["best_checkpoint_path"]
@@ -215,7 +216,7 @@ def main():
         evaluate_model(model, test_loader, device, verbose=True)
         return
 
-    if args.mode in ("gradcam", "gmar"):
+    if args.mode in ("gradcam", "gmar", "pca"):
 
         # Ensure Grad-CAM with CNN
         if args.mode == "gradcam" and args.arch != "cnn":
@@ -223,7 +224,7 @@ def main():
 
         # Ensure GMAR with ViT
         if args.mode == "gmar" and args.arch != "vit":
-            raise ValueError("gmar requires arch='vit'.")
+            raise ValueError("GMAR requires arch='vit'.")
 
         summary = load_probe_summary(args.dataset, args.arch, args.paradigm)
         num_classes = DATASETS[args.dataset]["num_classes"]
@@ -278,7 +279,7 @@ def main():
             relative_tag = "na" if relative is None else f"{float(relative):06.2f}"
             output_name = f"epoch_{int(record['epoch']):04d}_relative_{relative_tag}"
             print(
-                f"[{args.mode}] Epoch {int(record['epoch']):04d} | "
+                f"[{args.mode.upper()}] Epoch {int(record['epoch']):04d} | "
                 f"Val Acc {float(probe_checkpoint['best_val_acc']):.2f}% | "
                 f"Test Acc {float(probe_checkpoint['test_acc']):.2f}% | "
                 f"Relative Acc {float(relative):.2f}% | Total Samples: {total_samples} ({samples_per_class}/class)"
@@ -297,8 +298,21 @@ def main():
                     plot=args.plot,
                     resume=args.resume,
                 )
-            else:
+            elif args.mode == "gmar":
                 run_gmar_pipeline(
+                    probe_model,
+                    test_loader,
+                    args.dataset,
+                    args.arch,
+                    args.paradigm,
+                    device,
+                    val_fraction=args.val_fraction,
+                    output_name=output_name,
+                    plot=args.plot,
+                    resume=args.resume,
+                )
+            elif args.mode == "pca":
+                run_pca_pipeline(
                     probe_model,
                     test_loader,
                     args.dataset,
